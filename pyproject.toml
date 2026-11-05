@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "detect-and-suppress"
+version = "0.1.0"
+readme = "README.md"
+license-files = ["THIRD_PARTY_NOTICES.md", "third_party/licenses/*.txt"]
+description = "Feature suppression for SAE-based VLA defense experiments"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.22"]
+
+[project.scripts]
+das = "detect_and_suppress.cli:main"
+
+[project.optional-dependencies]
+pi05 = ["jax>=0.5"]
+smolvla = ["torch>=2"]
+probe-sklearn = ["scikit-learn>=1.5"]
+probe-torch = ["torch>=2"]
+evaluation = ["Pillow>=9.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["detect_and_suppress", "detect_and_suppress.*"]
+exclude = ["*.tests", "*.tests.*", "*.fixtures", "*.fixtures.*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"detect_and_suppress.adapters" = ["patches/*.patch", "patches/*.json"]

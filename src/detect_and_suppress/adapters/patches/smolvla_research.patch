@@ -1,0 +1,633 @@
+--- a/src/lerobot/policies/smolvla/modeling_smolvla.py
++++ b/src/lerobot/policies/smolvla/modeling_smolvla.py
+@@ -54,7 +54,7 @@
+ 
+ import math
+ from collections import deque
+-from typing import TypedDict
++from typing import Any, TypedDict
+ 
+ import torch
+ import torch.nn.functional as F  # noqa: N812
+@@ -244,6 +244,8 @@
+         self.config = config
+         self.init_rtc_processor()
+         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
++        self._attention_monitoring_enabled = False
++        self._last_selected_attention_maps: dict[str, dict[str, Tensor]] | None = None
+         self.reset()
+ 
+     def reset(self):
+@@ -251,6 +253,18 @@
+         self._queues = {
+             ACTION: deque(maxlen=self.config.n_action_steps),
+         }
++        self._attention_queue = deque(maxlen=self.config.n_action_steps)
++        self._last_selected_attention_maps = None
++
++    def set_attention_monitoring(self, enabled: bool) -> None:
++        self._attention_monitoring_enabled = bool(enabled)
++        self._attention_queue.clear()
++        self._last_selected_attention_maps = None
++
++    def consume_last_selected_attention_maps(self) -> dict[str, dict[str, Tensor]] | None:
++        attention_maps = self._last_selected_attention_maps
++        self._last_selected_attention_maps = None
++        return attention_maps
+ 
+     def init_rtc_processor(self):
+         """Initialize RTC processor if RTC is enabled in config."""
+@@ -272,8 +286,12 @@
+         return self.parameters()
+ 
+     def _get_action_chunk(
+-        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+-    ) -> Tensor:
++        self,
++        batch: dict[str, Tensor],
++        noise: Tensor | None = None,
++        return_attention: bool = False,
++        **kwargs: Unpack[ActionSelectKwargs],
++    ) -> Tensor | tuple[Tensor, dict[str, dict[str, Tensor] | None]]:
+         # TODO: Check if this for loop is needed.
+         # Context: In fact, self.queues contains only ACTION field, and in inference, we don't have action in the batch
+         # In the case of offline inference, we have the action in the batch
+@@ -283,14 +301,30 @@
+             if k in self._queues and k != ACTION:
+                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
+ 
+-        images, img_masks = self.prepare_images(batch)
++        if return_attention:
++            images, img_masks, image_streams = self.prepare_images(batch, return_streams=True)
++        else:
++            images, img_masks = self.prepare_images(batch)
++            image_streams = None
+         state = self.prepare_state(batch)
+         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+ 
+-        actions = self.model.sample_actions(
+-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+-        )
++        model_output = self.model.sample_actions(
++            images,
++            img_masks,
++            lang_tokens,
++            lang_masks,
++            state,
++            noise=noise,
++            image_streams=image_streams,
++            return_attention=return_attention,
++            **kwargs,
++        )
++        if return_attention:
++            actions, attention_summary = model_output
++        else:
++            actions = model_output
+ 
+         # Unpad actions
+         original_action_dim = self.config.action_feature.shape[0]
+@@ -299,6 +333,8 @@
+         if self.config.adapt_to_pi_aloha:
+             actions = self._pi_aloha_encode_actions(actions)
+ 
++        if return_attention:
++            return actions, attention_summary
+         return actions
+ 
+     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+@@ -339,13 +375,47 @@
+         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+ 
+         if self._check_get_actions_condition():
+-            actions = self._get_action_chunk(batch, noise)
++            if self._attention_monitoring_enabled:
++                actions, attention_summary = self._get_action_chunk(batch, noise, return_attention=True)
++            else:
++                actions = self._get_action_chunk(batch, noise)
++                attention_summary = None
+ 
+             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
+             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
+             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+-
+-        return self._queues[ACTION].popleft()
++            if self._attention_monitoring_enabled:
++                repeated_attention = self._repeat_attention_summary(attention_summary, self.config.n_action_steps)
++                self._attention_queue.extend(repeated_attention)
++
++        action = self._queues[ACTION].popleft()
++        if self._attention_monitoring_enabled and len(self._attention_queue) > 0:
++            self._last_selected_attention_maps = self._attention_queue.popleft()
++        else:
++            self._last_selected_attention_maps = None
++        return action
++
++    def _repeat_attention_summary(
++        self, attention_summary: dict[str, dict[str, Tensor] | None] | None, n_steps: int
++    ) -> list[dict[str, dict[str, Tensor]] | None]:
++        if not attention_summary:
++            return [None] * n_steps
++
++        cpu_summary: dict[str, dict[str, Tensor]] = {}
++        for group_name, group_values in attention_summary.items():
++            if not group_values:
++                continue
++            cpu_group = {}
++            for stream_name, value in group_values.items():
++                if value is None:
++                    continue
++                cpu_group[stream_name] = value.detach().to("cpu")
++            if cpu_group:
++                cpu_summary[group_name] = cpu_group
++
++        if not cpu_summary:
++            return [None] * n_steps
++        return [cpu_summary] * n_steps
+ 
+     def _check_get_actions_condition(self) -> bool:
+         return len(self._queues[ACTION]) == 0
+@@ -400,12 +470,13 @@
+             loss_dict["loss"] = loss.item()
+             return loss, loss_dict
+ 
+-    def prepare_images(self, batch):
++    def prepare_images(self, batch, return_streams: bool = False):
+         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
+         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
+         """
+         images = []
+         img_masks = []
++        image_streams = []
+         present_img_keys = [key for key in self.config.image_features if key in batch]
+         missing_img_keys = [key for key in self.config.image_features if key not in batch]
+ 
+@@ -430,6 +501,7 @@
+                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
+             images.append(img)
+             img_masks.append(mask)
++            image_streams.append(_feature_key_to_stream_name(key))
+ 
+         # Create image features not present in the batch
+         # as fully 0 padded images.
+@@ -440,6 +512,9 @@
+             mask = torch.zeros_like(mask)
+             images.append(img)
+             img_masks.append(mask)
++            image_streams.append(None)
++        if return_streams:
++            return images, img_masks, image_streams
+         return images, img_masks
+ 
+     def _pi_aloha_decode_state(self, state):
+@@ -524,6 +599,15 @@
+     padded_tensor[:, :d] = tensor  # Efficient in-place copy
+ 
+     return padded_tensor
++
++
++def _feature_key_to_stream_name(feature_key: str) -> str | None:
++    key = feature_key.lower()
++    if key.endswith("image2") or key.endswith("camera2") or "wrist" in key:
++        return "wrist"
++    if key.endswith("image") or key.endswith("camera1") or "agent" in key:
++        return "agent"
++    return None
+ 
+ 
+ class VLAFlowMatching(nn.Module):
+@@ -617,7 +701,14 @@
+         return time
+ 
+     def embed_prefix(
+-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
++        self,
++        images,
++        img_masks,
++        lang_tokens,
++        lang_masks,
++        state: torch.Tensor = None,
++        image_streams: list[str | None] | None = None,
++        return_attention: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         """Embed images with SigLIP and language tokens with embedding layer to prepare
+         for SmolVLM transformer processing.
+@@ -625,10 +716,14 @@
+         embs = []
+         pad_masks = []
+         att_masks = []
++        image_token_ranges: dict[str, tuple[int, int]] = {}
++        vision_attentions: dict[str, Tensor] = {}
++        current_position = 0
+         for _img_idx, (
+             img,
+             img_mask,
+         ) in enumerate(zip(images, img_masks, strict=False)):
++            stream_name = image_streams[_img_idx] if image_streams is not None else None
+             if self.add_image_special_tokens:
+                 image_start_token = (
+                     self.vlm_with_expert.embed_language_tokens(
+@@ -643,9 +738,13 @@
+                 att_masks += [0] * (image_start_mask.shape[-1])
+                 embs.append(image_start_token)
+                 pad_masks.append(image_start_mask)
+-
+-            img_emb = self.vlm_with_expert.embed_image(img)
+-            img_emb = img_emb
++                current_position += image_start_mask.shape[1]
++
++            if return_attention:
++                img_emb, vision_attention = self.vlm_with_expert.embed_image(img, return_attention=True)
++            else:
++                img_emb = self.vlm_with_expert.embed_image(img)
++                vision_attention = None
+ 
+             # Normalize image embeddings
+             img_emb_dim = img_emb.shape[-1]
+@@ -658,6 +757,11 @@
+             pad_masks.append(img_mask)
+ 
+             att_masks += [0] * (num_img_embs)
++            if stream_name is not None:
++                image_token_ranges[stream_name] = (current_position, current_position + num_img_embs)
++                if vision_attention is not None:
++                    vision_attentions[stream_name] = vision_attention
++            current_position += num_img_embs
+             if self.add_image_special_tokens:
+                 image_end_token = (
+                     self.vlm_with_expert.embed_language_tokens(
+@@ -672,6 +776,7 @@
+                 embs.append(image_end_token)
+                 pad_masks.append(image_end_mask)
+                 att_masks += [0] * (image_end_mask.shape[1])
++                current_position += image_end_mask.shape[1]
+         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
+         # Normalize language embeddings
+         lang_emb_dim = lang_emb.shape[-1]
+@@ -708,6 +813,8 @@
+ 
+         att_masks = att_masks.expand(bsize, -1)
+ 
++        if return_attention:
++            return embs, pad_masks, att_masks, image_token_ranges, vision_attentions
+         return embs, pad_masks, att_masks
+ 
+     def embed_suffix(self, noisy_actions, timestep):
+@@ -776,7 +883,7 @@
+ 
+         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+         position_ids = torch.cumsum(pad_masks, dim=1) - 1
+-        (_, suffix_out), _ = self.vlm_with_expert.forward(
++        (_, suffix_out), _, _ = self.vlm_with_expert.forward(
+             attention_mask=att_2d_masks,
+             position_ids=position_ids,
+             past_key_values=None,
+@@ -799,6 +906,8 @@
+         lang_masks,
+         state,
+         noise=None,
++        image_streams: list[str | None] | None = None,
++        return_attention: bool = False,
+         **kwargs: Unpack[ActionSelectKwargs],
+     ) -> Tensor:
+         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+@@ -809,13 +918,26 @@
+             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+             noise = self.sample_noise(actions_shape, device)
+ 
+-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+-            images, img_masks, lang_tokens, lang_masks, state=state
+-        )
++        if return_attention:
++            prefix_embs, prefix_pad_masks, prefix_att_masks, image_token_ranges, vision_attentions = self.embed_prefix(
++                images,
++                img_masks,
++                lang_tokens,
++                lang_masks,
++                state=state,
++                image_streams=image_streams,
++                return_attention=True,
++            )
++        else:
++            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
++                images, img_masks, lang_tokens, lang_masks, state=state
++            )
++            image_token_ranges = {}
++            vision_attentions = {}
+         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+         # Compute image and language key value cache
+-        _, past_key_values = self.vlm_with_expert.forward(
++        _, past_key_values, _ = self.vlm_with_expert.forward(
+             attention_mask=prefix_att_2d_masks,
+             position_ids=prefix_position_ids,
+             past_key_values=None,
+@@ -827,16 +949,18 @@
+         dt = -1.0 / num_steps
+ 
+         x_t = noise
++        last_attn_probs = None
+         for step in range(num_steps):
+             time = 1.0 + step * dt
+             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+ 
+-            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
++            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor, capture_attention: bool = False):
+                 return self.denoise_step(
+                     x_t=input_x_t,
+                     prefix_pad_masks=prefix_pad_masks,
+                     past_key_values=past_key_values,
+                     timestep=current_timestep,
++                    return_attention=capture_attention,
+                 )
+ 
+             if self._rtc_enabled():
+@@ -853,14 +977,35 @@
+                     execution_horizon=execution_horizon,
+                 )
+             else:
+-                v_t = denoise_step_partial_call(x_t)
++                if return_attention and step == num_steps - 1:
++                    v_t, last_attn_probs = denoise_step_partial_call(x_t, capture_attention=True)
++                else:
++                    v_t = denoise_step_partial_call(x_t)
+ 
+             x_t = x_t + dt * v_t
+ 
+             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+ 
+-        return x_t
++        if not return_attention:
++            return x_t
++
++        action_attentions = self._extract_action_attentions(last_attn_probs, image_token_ranges)
++        return x_t, {"vit": vision_attentions, "action": action_attentions}
++
++    def _extract_action_attentions(
++        self, attn_probs: Tensor | None, image_token_ranges: dict[str, tuple[int, int]]
++    ) -> dict[str, Tensor]:
++        if attn_probs is None:
++            return {}
++
++        mean_attn = attn_probs.to(dtype=torch.float32).mean(dim=1)
++        last_action_attn = mean_attn[:, -1]
++        extracted = {}
++        for stream_name, (start_idx, end_idx) in image_token_ranges.items():
++            if end_idx > start_idx:
++                extracted[stream_name] = last_action_attn[:, start_idx:end_idx]
++        return extracted
+ 
+     def denoise_step(
+         self,
+@@ -868,6 +1013,7 @@
+         past_key_values,
+         x_t,
+         timestep,
++        return_attention: bool = False,
+     ):
+         """Apply one denoising step of the noise `x_t` at a given timestep."""
+         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+@@ -883,16 +1029,19 @@
+         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+ 
+-        outputs_embeds, _ = self.vlm_with_expert.forward(
++        outputs_embeds, _, last_attn_probs = self.vlm_with_expert.forward(
+             attention_mask=full_att_2d_masks,
+             position_ids=position_ids,
+             past_key_values=past_key_values,
+             inputs_embeds=[None, suffix_embs],
+             use_cache=self.config.use_cache,
+             fill_kv_cache=False,
++            return_last_attn=return_attention,
+         )
+         suffix_out = outputs_embeds[1]
+         suffix_out = suffix_out[:, -self.config.chunk_size :]
+         suffix_out = suffix_out.to(dtype=torch.float32)
+         v_t = self.action_out_proj(suffix_out)
++        if return_attention:
++            return v_t, last_attn_probs
+         return v_t
+--- a/src/lerobot/policies/smolvla/smolvlm_with_expert.py
++++ b/src/lerobot/policies/smolvla/smolvlm_with_expert.py
+@@ -177,19 +177,37 @@
+         if self.train_expert_only:
+             self.vlm.eval()
+ 
+-    def embed_image(self, image: torch.Tensor):
++    def _get_vision_probe_attention(self, image_hidden_states: torch.Tensor) -> torch.Tensor | None:
++        vision_model = self.get_vlm_model().vision_model
++        if not getattr(vision_model, "use_head", False):
++            return None
++
++        batch_size = image_hidden_states.shape[0]
++        probe = vision_model.head.probe.repeat(batch_size, 1, 1).to(
++            device=image_hidden_states.device,
++            dtype=image_hidden_states.dtype,
++        )
++        _, attn_weights = vision_model.head.attention(
++            probe,
++            image_hidden_states,
++            image_hidden_states,
++            need_weights=True,
++            average_attn_weights=False,
++        )
++        return attn_weights[:, :, 0].mean(dim=1)
++
++    def embed_image(self, image: torch.Tensor, return_attention: bool = False):
+         patch_attention_mask = None
+-        # Get sequence from the vision encoder
+-        image_hidden_states = (
+-            self.get_vlm_model()
+-            .vision_model(
+-                pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
+-                patch_attention_mask=patch_attention_mask,
+-            )
+-            .last_hidden_state
+-        )
++        vision_outputs = self.get_vlm_model().vision_model(
++            pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
++            patch_attention_mask=patch_attention_mask,
++        )
++        image_hidden_states = vision_outputs.last_hidden_state
++        vision_attention = self._get_vision_probe_attention(image_hidden_states) if return_attention else None
+         # Modality projection & resampling
+         image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
++        if return_attention:
++            return image_hidden_states, vision_attention
+         return image_hidden_states
+ 
+     def embed_language_tokens(self, tokens: torch.Tensor):
+@@ -207,6 +225,7 @@
+         use_cache: bool = True,
+         fill_kv_cache: bool = True,
+         past_key_values=None,
++        return_probs: bool = False,
+     ) -> list[torch.Tensor]:
+         query_states = []
+         key_states = []
+@@ -267,10 +286,16 @@
+ 
+         attention_interface = self.get_attention_interface()
+ 
+-        att_output = attention_interface(
+-            attention_mask_, batch_size, head_dim, query_states, key_states, value_states
+-        )
+-        return [att_output], past_key_values
++        att_output, att_probs = attention_interface(
++            attention_mask_,
++            batch_size,
++            head_dim,
++            query_states,
++            key_states,
++            value_states,
++            return_probs=return_probs,
++        )
++        return [att_output], past_key_values, [att_probs]
+ 
+     def forward_cross_attn_layer(
+         self,
+@@ -284,10 +309,12 @@
+         use_cache: bool = True,
+         fill_kv_cache: bool = True,
+         past_key_values=None,
++        return_probs: bool = False,
+     ) -> list[torch.Tensor]:
+         attention_interface = self.get_attention_interface()
+ 
+         att_outputs = []
++        att_probs = []
+         assert len(inputs_embeds) == 2 or (use_cache and past_key_values is not None and not fill_kv_cache), (
+             f"Both len(inputs_embeds) == {len(inputs_embeds)} and past_key_values is {past_key_values}"
+         )
+@@ -314,10 +341,17 @@
+             query_states = apply_rope(query_state, position_id)
+             key_states = apply_rope(key_state, position_id)
+ 
+-            att_output = attention_interface(
+-                prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
++            att_output, prefix_probs = attention_interface(
++                prefix_attention_mask,
++                batch_size,
++                head_dim,
++                query_states,
++                key_states,
++                value_states,
++                return_probs=return_probs,
+             )
+             att_outputs.append(att_output)
++            att_probs.append(prefix_probs)
+         else:
+             expert_position_id = position_ids
+ 
+@@ -372,20 +406,23 @@
+ 
+             expert_query_states = apply_rope(expert_query_state, expert_position_id)
+ 
+-            att_output = attention_interface(
++            att_output, expert_probs = attention_interface(
+                 expert_attention_mask,
+                 batch_size,
+                 head_dim,
+                 expert_query_states,
+                 expert_key_states,
+                 expert_value_states,
++                return_probs=return_probs,
+             )
+             att_outputs.append(att_output)
++            att_probs.append(expert_probs)
+         else:
+             att_outputs.append(None)
++            att_probs.append(None)
+ 
+         # att_output = att_output.to(dtype=models[i].dtype)
+-        return att_outputs, past_key_values
++        return att_outputs, past_key_values, att_probs
+ 
+     def get_model_layers(self, models: list) -> list:
+         vlm_layers = []
+@@ -409,6 +446,7 @@
+         inputs_embeds: list[torch.FloatTensor] = None,
+         use_cache: bool | None = None,
+         fill_kv_cache: bool | None = None,
++        return_last_attn: bool = False,
+     ):
+         models = [self.get_vlm_model().text_model, self.lm_expert]
+         model_layers = self.get_model_layers(models)
+@@ -423,13 +461,14 @@
+         # RMSNorm
+         num_layers = self.num_vlm_layers
+         head_dim = self.vlm.config.text_config.head_dim
++        last_attn_probs = None
+         for layer_idx in range(num_layers):
+             if (
+                 fill_kv_cache
+                 or "cross" not in self.attention_mode
+                 or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
+             ):
+-                att_outputs, past_key_values = self.forward_attn_layer(
++                att_outputs, past_key_values, attn_probs = self.forward_attn_layer(
+                     model_layers,
+                     inputs_embeds,
+                     layer_idx,
+@@ -440,9 +479,10 @@
+                     use_cache=use_cache,
+                     fill_kv_cache=fill_kv_cache,
+                     past_key_values=past_key_values,
++                    return_probs=return_last_attn and layer_idx == num_layers - 1,
+                 )
+             else:
+-                att_outputs, past_key_values = self.forward_cross_attn_layer(
++                att_outputs, past_key_values, attn_probs = self.forward_cross_attn_layer(
+                     model_layers,
+                     inputs_embeds,
+                     layer_idx,
+@@ -453,6 +493,7 @@
+                     use_cache=use_cache,
+                     fill_kv_cache=fill_kv_cache,
+                     past_key_values=past_key_values,
++                    return_probs=return_last_attn and layer_idx == num_layers - 1,
+                 )
+             outputs_embeds = []
+             start = 0
+@@ -486,6 +527,9 @@
+                 else:
+                     outputs_embeds.append(None)
+ 
++            if return_last_attn and layer_idx == num_layers - 1:
++                last_attn_probs = attn_probs[1] if len(attn_probs) > 1 else attn_probs[0]
++
+             inputs_embeds = outputs_embeds
+ 
+         # final norm
+@@ -496,14 +540,21 @@
+                 outputs_embeds.append(out_emb)
+             else:
+                 outputs_embeds.append(None)
+-        return outputs_embeds, past_key_values
++        return outputs_embeds, past_key_values, last_attn_probs
+ 
+     def get_attention_interface(self):
+         attention_interface = self.eager_attention_forward
+         return attention_interface
+ 
+     def eager_attention_forward(
+-        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
++        self,
++        attention_mask,
++        batch_size,
++        head_dim,
++        query_states,
++        key_states,
++        value_states,
++        return_probs: bool = False,
+     ):
+         num_att_heads = self.num_attention_heads
+         num_key_value_heads = self.num_key_value_heads
+@@ -547,4 +598,4 @@
+         # we use -1 because sequence length can change
+         att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
+ 
+-        return att_output
++        return att_output, probs if return_probs else None

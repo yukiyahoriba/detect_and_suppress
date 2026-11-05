@@ -1,0 +1,21 @@
+{
+  "pi05": {
+    "libero_python_sha256": "7a709849e9188eb016e73195b9c41baf11a4b18acc10c198073db03c860eb457",
+    "modules": {
+      "openpi.transforms": "a1b94e9e72849a18834778f229c6bb389a495eb7fbe0aa800edea728b9424ff4",
+      "openpi.policies.libero_policy": "10f5f32c1ace1dc8a3b502620bd38d0d7cf25c3fb832f745a1b0fcb94431c8ac",
+      "openpi.training.config": "c34231f888dba5dc981d808765b3d98775ab845b04313bf53fcecd567c520b0d",
+      "openpi.models.pi0_config": "e15d71586f1a561b35c5651227607613fb16d2df411f3708b1c9d36b02544285",
+      "openpi_client.image_tools": "d48b4bd7f44e79fe6db8a8e07c9161144fa250be686e1245014a8b47e6171977"
+    },
+    "assets_sha256": "68ebc7e4bf7b349e132c6c6cfe8bd484af6133a36ac8cbddffead2cd8d11cc66"
+  },
+  "smolvla": {
+    "libero_python_sha256": "f1884f1eaa552665db9f9af1e970b2a251d080d5ad1abd881b587556f9e3fac3",
+    "modules": {
+      "lerobot.envs.libero": "bf0974a0a4ea77e8f06ef383544b32f1427786075297b79c35f0c26ed2872f0b",
+      "lerobot.envs.configs": "b5225c71a69d60992f8b7fc40b6edb6432b6a1651e1a49fe9da5832a5a74e19c"
+    },
+    "assets_sha256": "68ebc7e4bf7b349e132c6c6cfe8bd484af6133a36ac8cbddffead2cd8d11cc66"
+  }
+}

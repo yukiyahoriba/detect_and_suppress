@@ -1,0 +1,1366 @@
+--- a/src/openpi/models/gemma.py
++++ b/src/openpi/models/gemma.py
+@@ -28,6 +28,7 @@
+ from collections.abc import Sequence
+ import dataclasses
+ from typing import Literal, TypeAlias
++from typing import Any
+ 
+ import einops
+ import flax.linen as nn
+@@ -37,6 +38,64 @@
+ import openpi.models.lora as lora
+ import openpi.shared.array_typing as at
+ import openpi.training.sharding as sharding
++
++# DRVLA_SAE_INSTRUMENTATION
++def _sae_cfg_get(config: dict[str, Any] | None, key: str, default=None):
++    return default if config is None else config.get(key, default)
++
++def _sae_apply_hook(xs, layer_idx, hook_config: dict[str, Any] | None):
++    if hook_config is None:
++        return xs, None
++    expert = int(_sae_cfg_get(hook_config, 'expert', 0))
++    x = xs[expert]
++    if x is None:
++        return xs, None
++    activations = jnp.mean(x, axis=1) if bool(_sae_cfg_get(hook_config, 'pool_mean', True)) else x
++    direction = _sae_cfg_get(hook_config, 'direction')
++    mode = _sae_cfg_get(hook_config, 'mode')
++    if direction is not None and mode is not None:
++        is_target = layer_idx == int(_sae_cfg_get(hook_config, 'layer', -1))
++        intervention_active = jnp.asarray(_sae_cfg_get(hook_config, 'intervention_active', True), dtype=jnp.bool_)
++        detector_mean = _sae_cfg_get(hook_config, "detector_mean")
++        if detector_mean is not None:
++            detector_scale = jnp.asarray(_sae_cfg_get(hook_config, "detector_scale"), dtype=jnp.float32)
++            detector_coef = jnp.asarray(_sae_cfg_get(hook_config, "detector_coef"), dtype=jnp.float32)
++            detector_intercept = jnp.asarray(_sae_cfg_get(hook_config, "detector_intercept"), dtype=jnp.float32)
++            detector_threshold = jnp.asarray(_sae_cfg_get(hook_config, "detector_threshold"), dtype=jnp.float32)
++            detector_activation = activations.astype(jnp.float32)
++            detector_score = (
++                (detector_activation - jnp.asarray(detector_mean, dtype=jnp.float32)) / detector_scale
++            ) @ detector_coef + detector_intercept
++            detected_here = (detector_score > detector_threshold)[:, None, None]
++            detector_layer = int(_sae_cfg_get(hook_config, "detector_layer", -1))
++            intervention_active = jnp.where(layer_idx == detector_layer, detected_here, intervention_active)
++        v = jnp.asarray(direction, dtype=x.dtype)
++        v = v / jnp.maximum(jnp.linalg.norm(v), 1e-8)
++        if mode == 1:
++            steered = x + float(_sae_cfg_get(hook_config, 'alpha', 1.0)) * v
++        elif mode == 2:
++            steered = x - jnp.sum(x * v, axis=-1, keepdims=True) * v
++        elif mode == 3:
++            hidden_norm = jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True).astype(x.dtype)
++            steered = x - float(_sae_cfg_get(hook_config, 'alpha', 1.0)) * hidden_norm * v
++        else:
++            steered = x
++        steered = jnp.where(intervention_active, steered, x)
++        x = jnp.where(is_target, steered, x)
++        xs = list(xs)
++        xs[expert] = x
++    ablation_layers = _sae_cfg_get(hook_config, "ablation_layers")
++    ablation_bases = _sae_cfg_get(hook_config, "ablation_bases")
++    if ablation_layers is not None and ablation_bases is not None:
++        for target_layer, basis_values in zip(ablation_layers, ablation_bases, strict=True):
++            basis = jnp.asarray(basis_values, dtype=x.dtype)
++            coefficients = jnp.einsum("btd,rd->btr", x, basis)
++            projected = x - jnp.einsum("btr,rd->btd", coefficients, basis)
++            x = jnp.where(layer_idx == target_layer, projected, x)
++        xs = list(xs)
++        xs[expert] = x
++    return xs, activations
++
+ 
+ PALIGEMMA_VOCAB_SIZE = 257_152
+ 
+@@ -161,7 +220,16 @@
+     configs: Sequence[Config]
+ 
+     @nn.compact
+-    def __call__(self, xs, positions, attn_mask, kv_cache):
++    def __call__(
++        self,
++        xs,
++        positions,
++        attn_mask,
++        kv_cache,
++        *,
++        return_attn_summary: bool = False,
++        attn_query_indices=None,
++    ):
+         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
+         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
+         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
+@@ -226,6 +294,20 @@
+         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+ 
+         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
++        attn_summary = None
++        if return_attn_summary:
++            # [B, K, G, T, S] -> [B, S] using one query token averaged over heads.
++            if attn_query_indices is None:
++                query_probs = probs[:, :, :, -1, :]
++            else:
++                query_indices = jnp.asarray(attn_query_indices, dtype=jnp.int32)
++                query_indices = jnp.clip(query_indices, 0, probs.shape[3] - 1)
++                query_probs = jnp.take_along_axis(
++                    probs,
++                    query_indices[:, None, None, None, None],
++                    axis=3,
++                )[:, :, :, 0, :]
++            attn_summary = jnp.mean(query_probs, axis=(1, 2), dtype=jnp.float32)
+ 
+         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
+         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+@@ -246,7 +328,7 @@
+             else:
+                 out.append(None)
+ 
+-        return out, (k, v)
++        return out, (k, v), attn_summary
+ 
+ 
+ @at.typecheck
+@@ -290,8 +372,39 @@
+     dropout_bdims: tuple[int, ...] = ()
+ 
+     @nn.compact
+-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
++    def __call__(
++        self,
++        xs,
++        kv_cache,
++        positions,
++        attn_mask,
++        adarms_cond,
++        return_attn_summary: bool = False,
++        attn_query_indices=None,
++        deterministic=True,
++        sae_hook_config=None,
++        layer_idx: int = -1,
++    ):  # noqa: FBT002
++        probe_carry = _sae_cfg_get(sae_hook_config, "detector_mean") is not None
++        if probe_carry:
++            # Preserve the detector decision across scanned blocks until the steering layer.
++            xs, detected = xs
++            expert = int(_sae_cfg_get(sae_hook_config, "expert", 0))
++            activation = jnp.mean(xs[expert], axis=1).astype(jnp.float32)
++
++            def detect(_):
++                score = (
++                    ((activation - sae_hook_config["detector_mean"]) / sae_hook_config["detector_scale"])
++                    @ sae_hook_config["detector_coef"] + sae_hook_config["detector_intercept"]
++                )
++                return score > sae_hook_config["detector_threshold"]
++
++            detected = jax.lax.cond(layer_idx == sae_hook_config["detector_layer"], detect, lambda _: detected, operand=None)
++            block_hook = {**sae_hook_config, "detector_mean": None, "intervention_active": detected[:, None, None]}
++        else:
++            block_hook = sae_hook_config
+         xs = sharding.activation_sharding_constraint(xs)
++        xs, sae_activations = _sae_apply_hook(xs, layer_idx, block_hook)
+         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
+ 
+         attn = Attention(configs=self.configs, name="attn")
+@@ -305,7 +418,14 @@
+             gates.append(gate if x is not None else None)
+ 
+         pre_attn = sharding.activation_sharding_constraint(pre_attn)
+-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
++        post_attn, kv_cache, attn_summary = attn(
++            pre_attn,
++            positions,
++            attn_mask,
++            kv_cache,
++            return_attn_summary=return_attn_summary,
++            attn_query_indices=attn_query_indices,
++        )
+         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
+         post_attn = sharding.activation_sharding_constraint(post_attn)
+         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
+@@ -330,7 +450,7 @@
+         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
+         xs = sharding.activation_sharding_constraint(xs)
+ 
+-        return xs, kv_cache
++        return (xs, detected) if probe_carry else xs, (kv_cache, attn_summary, sae_activations)
+ 
+ 
+ KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
+@@ -359,7 +479,7 @@
+         block_cls = nn.remat(
+             Block,
+             prevent_cse=False,
+-            static_argnums=(5,),  # 0=self, 6=deterministic
++            static_argnums=(6, 8, 9),  # 0=self, 6=return_attn_summary, 8=deterministic, 9=sae_hook_config
+             policy=jax.checkpoint_policies.nothing_saveable,
+         )
+         self.layers = nn.scan(
+@@ -372,7 +492,11 @@
+                 nn.broadcast,
+                 nn.broadcast,
+                 nn.broadcast,
+-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
++                nn.broadcast,
++                nn.broadcast,
++                nn.broadcast,
++                0,
++            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=return_attn_summary, 5=attn_query_indices, 6=deterministic, 7=sae_hook_config, 8=layer_idx
+             length=self.configs[0].depth,
+         )(
+             configs=self.configs,
+@@ -395,20 +519,56 @@
+         adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+         *,
+         kv_cache: KVCache | None = None,
++        return_attn_summary: bool = False,
++        return_all_attn_summaries: bool = False,
++        attn_query_indices: at.Int[at.Array, " b"] | None = None,
+         deterministic: bool = True,
+-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
++        sae_hook_config: dict[str, Any] | None = None,
++    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache] | tuple[
++        Sequence[at.Float[at.Array, "b _t _d"] | None],
++        KVCache,
++        at.Float[at.Array, "..."] | None,
++    ]:
+         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
+         mask = jnp.asarray(mask)[:, None, :, :]
+         if adarms_cond is None:
+             adarms_cond = [None] * len(self.configs)
+ 
+-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
++        probe_carry = _sae_cfg_get(sae_hook_config, "detector_mean") is not None
++        carry = embedded
++        if probe_carry:
++            expert = int(_sae_cfg_get(sae_hook_config, "expert", 0))
++            carry = (embedded, jnp.zeros((embedded[expert].shape[0],), dtype=jnp.bool_))
++        embedded, layer_outputs = self.layers(
++            carry,
++            kv_cache,
++            positions,
++            mask,
++            adarms_cond,
++            return_attn_summary,
++            attn_query_indices,
++            deterministic,
++            sae_hook_config,
++            jnp.arange(self.configs[0].depth),
++        )
++        if probe_carry:
++            embedded, _ = embedded
++        kv_cache, attn_summaries, sae_activations = layer_outputs
+ 
+         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
+ 
+-        return [
++        outputs = [
+             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
+-        ], kv_cache
++        ]
++        if return_attn_summary:
++            if attn_summaries is None:
++                return outputs, kv_cache, None
++            if return_all_attn_summaries:
++                return outputs, kv_cache, attn_summaries
++            return outputs, kv_cache, attn_summaries[-1]
++        if sae_hook_config is not None:
++            return outputs, kv_cache, sae_activations
++        return outputs, kv_cache
+ 
+     def init(self, use_adarms: Sequence[bool]):
+         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
+--- a/src/openpi/models/pi0.py
++++ b/src/openpi/models/pi0.py
+@@ -14,6 +14,8 @@
+ from openpi.shared import array_typing as at
+ 
+ logger = logging.getLogger("openpi")
++
++LLM_PROMPT_ATTENTION_LAYERS = (8, 12, 15, 17)
+ 
+ 
+ def make_attn_mask(input_mask, mask_ar):
+@@ -135,6 +137,101 @@
+         input_mask = jnp.concatenate(input_mask, axis=1)
+         ar_mask = jnp.array(ar_mask)
+         return tokens, input_mask, ar_mask
++
++
++    def extract_patch_probe_residuals(
++        self,
++        observation: _model.Observation,
++        *,
++        llm_layers: tuple[int, ...] = (0, 5, 11, 17),
++        vit_layers: tuple[int, ...] = (0, 8, 17, 26),
++        image_keys: tuple[str, ...] = ("base_0_rgb",),
++    ) -> dict[str, at.Float[at.Array, "b l d"]]:
++        """Extract mean-pooled ViT and PaliGemma residuals in one prefix forward."""
++        observation = _model.preprocess_observation(None, observation, train=False)
++        if not llm_layers or any(layer < 0 or layer >= 18 for layer in llm_layers):
++            raise ValueError(f"LLM layers must be in [0, 17], got {llm_layers}")
++        if not vit_layers or any(layer < 0 or layer >= 27 for layer in vit_layers):
++            raise ValueError(f"ViT layers must be in [0, 26], got {vit_layers}")
++        missing = set(image_keys).difference(observation.images)
++        if missing:
++            raise ValueError(f"Missing requested image keys: {sorted(missing)}")
++
++        tokens = []
++        input_masks = []
++        ar_mask = []
++        vit_outputs = {}
++        for image_key in observation.images:
++            image_tokens, details = self.PaliGemma.img(observation.images[image_key], train=False)
++            tokens.append(image_tokens)
++            input_masks.append(
++                einops.repeat(observation.image_masks[image_key], "b -> b s", s=image_tokens.shape[1])
++            )
++            ar_mask += [False] * image_tokens.shape[1]
++            if image_key in image_keys:
++                vit_outputs[image_key] = jnp.stack(
++                    [
++                        jnp.mean(
++                            details["encoder"][f"block{layer:02d}"]["+mlp"],
++                            axis=1,
++                            dtype=jnp.float32,
++                        )
++                        for layer in vit_layers
++                    ],
++                    axis=1,
++                )
++
++        if observation.tokenized_prompt is not None:
++            prompt_tokens = self.PaliGemma.llm(observation.tokenized_prompt, method="embed")
++            tokens.append(prompt_tokens)
++            input_masks.append(observation.tokenized_prompt_mask)
++            ar_mask += [False] * prompt_tokens.shape[1]
++        prefix_tokens = jnp.concatenate(tokens, axis=1)
++        prefix_mask = jnp.concatenate(input_masks, axis=1)
++        prefix_ar_mask = jnp.asarray(ar_mask)
++        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
++        positions = jnp.cumsum(prefix_mask, axis=1) - 1
++        hook = {"layer": -1, "expert": 0, "pool_mean": True, "direction": None, "mode": 0, "alpha": 1.0}
++        _, _, all_llm = self.PaliGemma.llm(
++            [prefix_tokens, None],
++            mask=prefix_attn_mask,
++            positions=positions,
++            sae_hook_config=hook,
++        )
++        result = {"llm": jnp.stack([all_llm[layer] for layer in llm_layers], axis=1)}
++        result.update({f"vit_{key}": value for key, value in vit_outputs.items()})
++        return result
++
++    def extract_vit_block_outputs(
++        self,
++        observation: _model.Observation,
++        *,
++        layers: tuple[int, ...] = (0, 8, 17, 26),
++        image_keys: tuple[str, ...] = ("base_0_rgb",),
++    ) -> dict[str, at.Float[at.Array, "b l d"]]:
++        """Return mean-pooled post-block SigLIP residual streams.
++
++        ``+mlp`` is the block output after both residual additions and before
++        the next block LayerNorm. Language and action tokens are absent here.
++        """
++        observation = _model.preprocess_observation(None, observation, train=False)
++        if not layers or any(layer < 0 or layer >= 27 for layer in layers):
++            raise ValueError(f"ViT layers must be in [0, 26], got {layers}")
++        missing = set(image_keys).difference(observation.images)
++        if missing:
++            raise ValueError(f"Missing requested image keys: {sorted(missing)}")
++
++        outputs = {}
++        for image_key in image_keys:
++            _, details = self.PaliGemma.img(observation.images[image_key], train=False)
++            outputs[image_key] = jnp.stack(
++                [
++                    jnp.mean(details["encoder"][f"block{layer:02d}"]["+mlp"], axis=1, dtype=jnp.float32)
++                    for layer in layers
++                ],
++                axis=1,
++            )
++        return outputs
+ 
+     @at.typecheck
+     def embed_suffix(
+@@ -277,3 +374,806 @@
+ 
+         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+         return x_0
++
++    def sample_actions_with_attention(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        *,
++        num_steps: int | at.Int[at.Array, ""] = 10,
++        noise: at.Float[at.Array, "b ah ad"] | None = None,
++    ) -> tuple[_model.Actions, dict]:
++        """Inference path that also returns action-token->image-token attention summaries.
++
++        Attention export is used only for visualization, so we keep the rollout path fast by:
++        1. sampling actions through the normal diffusion inference loop, and
++        2. running a single extra suffix pass on the final denoised action state to obtain
++           the last-query attention summary over prefix/image tokens.
++        """
++        observation = _model.preprocess_observation(None, observation, train=False)
++        num_steps_int = int(num_steps)
++        dt = -1.0 / float(num_steps_int)
++        batch_size = observation.state.shape[0]
++        if noise is None:
++            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
++
++        # Collect per-image token ranges inside prefix tokens in deterministic order.
++        image_token_ranges: dict[str, tuple[int, int]] = {}
++        image_token_counts: dict[str, int] = {}
++        vision_cls_to_image_tokens: dict[str, jnp.ndarray] = {}
++        image_cursor = 0
++        for image_key in observation.images:
++            image_tokens, image_out = self.PaliGemma.img(
++                observation.images[image_key],
++                train=False,
++                return_cls_attention_summary=True,
++            )
++            token_count = int(image_tokens.shape[1])
++            image_token_ranges[image_key] = (image_cursor, image_cursor + token_count)
++            image_token_counts[image_key] = token_count
++            cls_to_patches = image_out.get("encoder", {}).get("cls_to_patches")
++            if cls_to_patches is not None:
++                vision_cls_to_image_tokens[image_key] = cls_to_patches
++            image_cursor += token_count
++
++        # Fill KV cache with a prefix-only forward pass, also exporting LLM prompt-token attention.
++        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
++        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
++        positions = jnp.cumsum(prefix_mask, axis=1) - 1
++        if observation.tokenized_prompt_mask is not None:
++            prompt_lengths = jnp.sum(observation.tokenized_prompt_mask.astype(jnp.int32), axis=1)
++            prompt_last_query_indices = image_cursor + jnp.maximum(prompt_lengths - 1, 0)
++        else:
++            prefix_lengths = jnp.sum(prefix_mask.astype(jnp.int32), axis=1)
++            prompt_last_query_indices = jnp.maximum(prefix_lengths - 1, 0)
++        _, kv_cache, llm_prompt_attn_summaries = self.PaliGemma.llm(
++            [prefix_tokens, None],
++            mask=prefix_attn_mask,
++            positions=positions,
++            return_attn_summary=True,
++            return_all_attn_summaries=True,
++            attn_query_indices=prompt_last_query_indices,
++        )
++
++        base_key = "base_0_rgb" if "base_0_rgb" in observation.images else next(iter(observation.images))
++        wrist_key = "left_wrist_0_rgb" if "left_wrist_0_rgb" in observation.images else None
++        if wrist_key is None:
++            wrist_candidates = [key for key in observation.images if "wrist" in key]
++            wrist_key = wrist_candidates[0] if wrist_candidates else None
++
++        base_start, base_end = image_token_ranges[base_key]
++        base_token_count = base_end - base_start
++        prefix_token_count = int(prefix_tokens.shape[1])
++        llm_prompt_to_image_tokens_by_layer = {}
++        llm_prompt_to_base_by_layer = {}
++        llm_prompt_to_wrist_by_layer = {}
++        if llm_prompt_attn_summaries is not None:
++            num_layers = int(llm_prompt_attn_summaries.shape[0])
++            for layer_idx in LLM_PROMPT_ATTENTION_LAYERS:
++                if layer_idx < 0 or layer_idx >= num_layers:
++                    continue
++                layer_attn_to_prefix = llm_prompt_attn_summaries[layer_idx, :, :prefix_token_count]
++                per_image = {
++                    key: layer_attn_to_prefix[:, start:min(end, prefix_token_count)]
++                    for key, (start, end) in image_token_ranges.items()
++                }
++                layer_key = str(layer_idx)
++                llm_prompt_to_image_tokens_by_layer[layer_key] = per_image
++                llm_prompt_to_base_by_layer[layer_key] = per_image[base_key]
++                llm_prompt_to_wrist_by_layer[layer_key] = (
++                    per_image[wrist_key]
++                    if wrist_key is not None
++                    else jnp.zeros((batch_size, 0), dtype=layer_attn_to_prefix.dtype)
++                )
++
++        def step(carry):
++            x_t, time = carry
++            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++                observation, x_t, jnp.broadcast_to(time, batch_size)
++            )
++            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
++            prefix_to_suffix_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
++            full_attn_mask = jnp.concatenate([prefix_to_suffix_mask, suffix_attn_mask], axis=-1)
++            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
++
++            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
++                [None, suffix_tokens],
++                mask=full_attn_mask,
++                positions=positions,
++                kv_cache=kv_cache,
++                adarms_cond=[None, adarms_cond],
++            )
++            assert prefix_out is None
++            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            return x_t + dt * v_t, time + dt
++
++        def cond(carry):
++            _, time = carry
++            return time >= -dt / 2
++
++        x_t, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
++
++        attn_time = jnp.zeros((batch_size,), dtype=x_t.dtype)
++        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++            observation, x_t, attn_time
++        )
++        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
++        prefix_to_suffix_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
++        full_attn_mask = jnp.concatenate([prefix_to_suffix_mask, suffix_attn_mask], axis=-1)
++        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
++
++        (prefix_out, _), _, last_attn_summary = self.PaliGemma.llm(
++            [None, suffix_tokens],
++            mask=full_attn_mask,
++            positions=positions,
++            kv_cache=kv_cache,
++            adarms_cond=[None, adarms_cond],
++            return_attn_summary=True,
++        )
++        assert prefix_out is None
++
++        if last_attn_summary is None:
++            last_attn_summary = jnp.zeros((batch_size, prefix_token_count + self.action_horizon), dtype=jnp.float32)
++        action_to_prefix = last_attn_summary[:, :prefix_token_count]
++        action_to_image_tokens = {
++            key: action_to_prefix[:, start:min(end, prefix_token_count)] for key, (start, end) in image_token_ranges.items()
++        }
++        action_to_base = action_to_image_tokens[base_key]
++        action_to_wrist = (
++            action_to_image_tokens[wrist_key]
++            if wrist_key is not None
++            else jnp.zeros((batch_size, 0), dtype=action_to_prefix.dtype)
++        )
++        vision_cls_to_base = vision_cls_to_image_tokens.get(
++            base_key, jnp.zeros((batch_size, base_token_count), dtype=jnp.float32)
++        )
++        vision_cls_to_wrist = (
++            vision_cls_to_image_tokens.get(
++                wrist_key,
++                jnp.zeros((batch_size, image_token_counts.get(wrist_key, 0)), dtype=jnp.float32),
++            )
++            if wrist_key is not None
++            else jnp.zeros((batch_size, 0), dtype=jnp.float32)
++        )
++
++        extras = {
++            "attentions": {
++                "action_last_to_prefix": action_to_prefix,
++                "action_last_to_base_image": action_to_base,
++                "action_last_to_agent_image": action_to_base,
++                "action_last_to_wrist_image": action_to_wrist,
++                "action_last_to_left_wrist_image": action_to_wrist,
++                "action_last_to_image_tokens": action_to_image_tokens,
++                "vision_cls_to_base_image": vision_cls_to_base,
++                "vision_cls_to_agent_image": vision_cls_to_base,
++                "vision_cls_to_wrist_image": vision_cls_to_wrist,
++                "vision_cls_to_left_wrist_image": vision_cls_to_wrist,
++                "vision_cls_to_image_tokens": vision_cls_to_image_tokens,
++                "llm_prompt_last_attention_layers": jnp.asarray(
++                    tuple(int(layer) for layer in llm_prompt_to_image_tokens_by_layer), dtype=jnp.int32
++                ),
++                "llm_prompt_last_to_agent_image_by_layer": llm_prompt_to_base_by_layer,
++                "llm_prompt_last_to_base_image_by_layer": llm_prompt_to_base_by_layer,
++                "llm_prompt_last_to_wrist_image_by_layer": llm_prompt_to_wrist_by_layer,
++                "llm_prompt_last_to_left_wrist_image_by_layer": llm_prompt_to_wrist_by_layer,
++                "llm_prompt_last_to_image_tokens_by_layer": llm_prompt_to_image_tokens_by_layer,
++                "base_image_token_count": jnp.asarray(base_token_count, dtype=jnp.int32),
++                "prefix_token_count": jnp.asarray(prefix_token_count, dtype=jnp.int32),
++                "image_token_counts": {
++                    key: jnp.asarray(count, dtype=jnp.int32) for key, count in image_token_counts.items()
++                },
++            }
++        }
++        return x_t, extras
++
++    def sample_actions_with_sae(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        *,
++        layer: int = 5,
++        expert: int = 0,
++        pool: str = "mean",
++        direction=None,
++        mode: str | None = None,
++        alpha: float = 1.0,
++        num_steps: int | at.Int[at.Array, ""] = 10,
++        noise: at.Float[at.Array, "b ah ad"] | None = None,
++    ) -> tuple[_model.Actions, dict]:
++        """Sample actions while collecting or steering one residual-stream layer.
++
++        expert=0 targets PaliGemma, expert=1 targets the action expert. The returned
++        activations are from the final denoising pass and are mean-pooled by default.
++        """
++        observation = _model.preprocess_observation(None, observation, train=False)
++        dt = -1.0 / num_steps
++        batch_size = observation.state.shape[0]
++        if noise is None:
++            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
++
++        hook_config = {
++            "layer": layer,
++            "expert": expert,
++            "pool_mean": pool == "mean",
++            "direction": direction,
++            "mode": 1 if mode == "add" else 2 if mode == "ablate" else 0,
++            "alpha": alpha,
++        }
++        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
++        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
++        positions = jnp.cumsum(prefix_mask, axis=1) - 1
++        prefix_activations = None
++        if expert == 0:
++            _, kv_cache, prefix_activations = self.PaliGemma.llm(
++                [prefix_tokens, None],
++                mask=prefix_attn_mask,
++                positions=positions,
++                sae_hook_config=hook_config,
++            )
++        else:
++            _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
++
++        def step(carry):
++            x_t, time = carry
++            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++                observation, x_t, jnp.broadcast_to(time, batch_size)
++            )
++            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
++            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
++            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
++            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
++            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
++                [None, suffix_tokens],
++                mask=full_attn_mask,
++                positions=positions,
++                kv_cache=kv_cache,
++                adarms_cond=[None, adarms_cond],
++            )
++            assert prefix_out is None
++            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            return x_t + dt * v_t, time + dt
++
++        def cond(carry):
++            _, time = carry
++            return time >= -dt / 2
++
++        x_t, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
++        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++            observation, x_t, jnp.zeros((batch_size,), dtype=x_t.dtype)
++        )
++        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
++        prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
++        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
++        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
++        (prefix_out, suffix_out), _, activations = self.PaliGemma.llm(
++            [None, suffix_tokens],
++            mask=full_attn_mask,
++            positions=positions,
++            kv_cache=kv_cache,
++            adarms_cond=[None, adarms_cond],
++            sae_hook_config=hook_config,
++        )
++        assert prefix_out is None
++        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++        selected_source = prefix_activations if expert == 0 else activations
++        selected = selected_source[layer] if selected_source is not None else None
++        return x_t + dt * v_t, {"sae": {"activations": selected, "all_layer_activations": activations, "layer": layer, "expert": expert, "pool": pool}}
++
++    def sample_actions_with_sae_steering(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        *,
++        layer: int = 5,
++        expert: int = 0,
++        direction=None,
++        mode_id: int = 1,
++        alpha: float = 1.0,
++        num_steps: int | at.Int[at.Array, ""] = 10,
++        noise: at.Float[at.Array, "b ah ad"] | None = None,
++    ) -> _model.Actions:
++        """Sample actions with paper-style SAE residual-stream intervention.
++
++        This path recomputes the full prefix+suffix sequence at every flow-matching
++        denoising step, so a hooked PaliGemma layer is actually present at every
++        iteration rather than only in the prefix KV-cache prefill.
++        """
++        observation = _model.preprocess_observation(None, observation, train=False)
++        dt = -1.0 / num_steps
++        batch_size = observation.state.shape[0]
++        if noise is None:
++            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
++
++        hook_config = {
++            "layer": layer,
++            "expert": expert,
++            "pool_mean": True,
++            "direction": direction,
++            "mode": mode_id,
++            "alpha": alpha,
++        }
++        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
++
++        def step(carry):
++            x_t, time = carry
++            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++                observation, x_t, jnp.broadcast_to(time, batch_size)
++            )
++            input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
++            ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
++            attn_mask = make_attn_mask(input_mask, ar_mask)
++            positions = jnp.cumsum(input_mask, axis=1) - 1
++            (_, suffix_out), _, _ = self.PaliGemma.llm(
++                [prefix_tokens, suffix_tokens],
++                mask=attn_mask,
++                positions=positions,
++                adarms_cond=[None, adarms_cond],
++                sae_hook_config=hook_config,
++            )
++            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            return x_t + dt * v_t, time + dt
++
++        def cond(carry):
++            _, time = carry
++            return time >= -dt / 2
++
++        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
++        return x_0
++
++
++    def sample_actions_with_sae_steering_and_activation(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        *,
++        layer: int = 5,
++        expert: int = 0,
++        direction=None,
++        mode_id: int = 2,
++        alpha: float = 1.0,
++        intervention_active: bool | at.Bool[at.Array, ""] = True,
++        num_steps: int | at.Int[at.Array, ""] = 10,
++        noise: at.Float[at.Array, "b ah ad"] | None = None,
++    ) -> tuple[_model.Actions, dict]:
++        """Apply paper-style steering and return the final hooked pre-intervention activation.
++
++        The intervention is applied to every token at the selected residual-stream
++        layer for every action-expert flow-matching denoising iteration. The returned
++        activation is measured immediately before that intervention on the final
++        iteration that produced an executed action chunk.
++        """
++        if direction is None:
++            raise ValueError("direction is required for SAE steering")
++        observation = _model.preprocess_observation(None, observation, train=False)
++        dt = -1.0 / num_steps
++        batch_size = observation.state.shape[0]
++        if noise is None:
++            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
++
++        hook_config = {
++            "layer": layer,
++            "expert": expert,
++            "pool_mean": True,
++            "direction": direction,
++            "mode": mode_id,
++            "alpha": alpha,
++            "intervention_active": intervention_active,
++        }
++        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
++        activation_dim = len(direction)
++        initial_activation = jnp.zeros((batch_size, activation_dim), dtype=prefix_tokens.dtype)
++
++        def step(carry):
++            x_t, time, _ = carry
++            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++                observation, x_t, jnp.broadcast_to(time, batch_size)
++            )
++            input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
++            ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
++            attn_mask = make_attn_mask(input_mask, ar_mask)
++            positions = jnp.cumsum(input_mask, axis=1) - 1
++            (_, suffix_out), _, all_activations = self.PaliGemma.llm(
++                [prefix_tokens, suffix_tokens],
++                mask=attn_mask,
++                positions=positions,
++                adarms_cond=[None, adarms_cond],
++                sae_hook_config=hook_config,
++            )
++            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            return x_t + dt * v_t, time + dt, all_activations[layer]
++
++        def cond(carry):
++            _, time, _ = carry
++            return time >= -dt / 2
++
++        x_0, _, activation = jax.lax.while_loop(cond, step, (noise, 1.0, initial_activation))
++        return x_0, {"sae": {"activations": activation, "layer": layer, "expert": expert}}
++
++    def sample_actions_with_vit_probe_gated_sae_steering(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        detector_mean: at.Float[at.Array, "d"],
++        detector_scale: at.Float[at.Array, "d"],
++        detector_coef: at.Float[at.Array, "d"],
++        detector_intercept: at.Float[at.Array, ""],
++        detector_threshold: at.Float[at.Array, ""],
++        *,
++        detector_layer: int = 17,
++        layer: int = 5,
++        expert: int = 0,
++        direction=None,
++        mode_id: int = 3,
++        alpha: float = 1.0,
++        num_steps: int | at.Int[at.Array, ""] = 10,
++        noise: at.Float[at.Array, "b ah ad"] | None = None,
++    ) -> tuple[_model.Actions, dict]:
++        """Detect from a ViT post-block residual and gate PG SAE steering in one forward."""
++        if direction is None:
++            raise ValueError("direction is required for SAE steering")
++        if detector_layer < 0 or detector_layer >= 27:
++            raise ValueError("detector_layer must be a SigLIP layer in [0, 26]")
++        observation = _model.preprocess_observation(None, observation, train=False)
++        dt = -1.0 / num_steps
++        batch_size = observation.state.shape[0]
++        if noise is None:
++            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
++
++        input_mask = []
++        ar_mask = []
++        tokens = []
++        detector_activation = None
++        for name in observation.images:
++            image_tokens, details = self.PaliGemma.img(observation.images[name], train=False)
++            tokens.append(image_tokens)
++            input_mask.append(einops.repeat(observation.image_masks[name], "b -> b s", s=image_tokens.shape[1]))
++            ar_mask += [False] * image_tokens.shape[1]
++            if name == "base_0_rgb":
++                detector_activation = jnp.mean(
++                    details["encoder"][f"block{detector_layer:02d}"]["+mlp"], axis=1, dtype=jnp.float32
++                )
++        if detector_activation is None:
++            raise ValueError("base_0_rgb is required for the ViT detector")
++        if observation.tokenized_prompt is not None:
++            tokenized_inputs = self.PaliGemma.llm(observation.tokenized_prompt, method="embed")
++            tokens.append(tokenized_inputs)
++            input_mask.append(observation.tokenized_prompt_mask)
++            ar_mask += [False] * tokenized_inputs.shape[1]
++        prefix_tokens = jnp.concatenate(tokens, axis=1)
++        prefix_mask = jnp.concatenate(input_mask, axis=1)
++        prefix_ar_mask = jnp.asarray(ar_mask)
++
++        detector_score = (
++            ((detector_activation - detector_mean) / detector_scale) @ detector_coef + detector_intercept
++        )
++        detected = detector_score > detector_threshold
++        hook_config = {
++            "layer": layer,
++            "expert": expert,
++            "pool_mean": True,
++            "direction": direction,
++            "mode": mode_id,
++            "alpha": alpha,
++            "intervention_active": detected[:, None, None],
++        }
++        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
++        positions = jnp.cumsum(prefix_mask, axis=1) - 1
++        _, kv_cache, _ = self.PaliGemma.llm(
++            [prefix_tokens, None],
++            mask=prefix_attn_mask,
++            positions=positions,
++            sae_hook_config=hook_config,
++        )
++
++        def step(carry):
++            x_t, time = carry
++            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++                observation, x_t, jnp.broadcast_to(time, batch_size)
++            )
++            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
++            cached_prefix_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
++            full_attn_mask = jnp.concatenate([cached_prefix_mask, suffix_attn_mask], axis=-1)
++            suffix_positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
++            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
++                [None, suffix_tokens],
++                mask=full_attn_mask,
++                positions=suffix_positions,
++                kv_cache=kv_cache,
++                adarms_cond=[None, adarms_cond],
++            )
++            assert prefix_out is None
++            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            return x_t + dt * v_t, time + dt
++
++        def cond(carry):
++            _, time = carry
++            return time >= -dt / 2
++
++        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
++        return x_0, {
++            "probe": {
++                "score": detector_score,
++                "detected": detected,
++                "threshold": detector_threshold,
++                "layer": detector_layer,
++            }
++        }
++
++    def sample_actions_with_probe_gated_sae_steering(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        detector_mean: at.Float[at.Array, "d"],
++        detector_scale: at.Float[at.Array, "d"],
++        detector_coef: at.Float[at.Array, "d"],
++        detector_intercept: at.Float[at.Array, ""],
++        detector_threshold: at.Float[at.Array, ""],
++        *,
++        detector_layer: int = 0,
++        layer: int = 5,
++        expert: int = 0,
++        direction=None,
++        mode_id: int = 3,
++        alpha: float = 1.0,
++        num_steps: int | at.Int[at.Array, ""] = 10,
++        noise: at.Float[at.Array, "b ah ad"] | None = None,
++    ) -> tuple[_model.Actions, dict]:
++        """Probe a PG residual stream and gate an SAE intervention in the same prefix forward."""
++        if direction is None:
++            raise ValueError("direction is required for SAE steering")
++        if not 0 <= detector_layer <= layer < 18 or expert != 0:
++            raise ValueError("PG steering requires 0 <= detector_layer <= layer < 18 and expert=0")
++        observation = _model.preprocess_observation(None, observation, train=False)
++        dt = -1.0 / num_steps
++        batch_size = observation.state.shape[0]
++        if noise is None:
++            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
++
++        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
++        if detector_layer == 0:
++            # The layer-0 collection hook records this exact unmasked token mean at block input.
++            detector_activation = jnp.mean(prefix_tokens, axis=1).astype(jnp.float32)
++            detector_score = (
++                ((detector_activation - detector_mean) / detector_scale) @ detector_coef + detector_intercept
++            )
++            detected = detector_score > detector_threshold
++            detector_hook_config = {}
++            intervention_active = detected[:, None, None]
++        else:
++            detector_hook_config = {
++                "detector_layer": detector_layer,
++                "detector_mean": detector_mean,
++                "detector_scale": detector_scale,
++                "detector_coef": detector_coef,
++                "detector_intercept": detector_intercept,
++                "detector_threshold": detector_threshold,
++            }
++            intervention_active = jnp.asarray(False, dtype=jnp.bool_)
++        hook_config = {
++            "layer": layer,
++            "expert": expert,
++            "pool_mean": True,
++            "direction": direction,
++            "mode": mode_id,
++            "alpha": alpha,
++            "intervention_active": intervention_active,
++            **detector_hook_config,
++        }
++
++        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
++        positions = jnp.cumsum(prefix_mask, axis=1) - 1
++        _, kv_cache, all_activations = self.PaliGemma.llm(
++            [prefix_tokens, None],
++            mask=prefix_attn_mask,
++            positions=positions,
++            sae_hook_config=hook_config,
++        )
++        if detector_layer != 0:
++            detector_activation = all_activations[detector_layer].astype(jnp.float32)
++            detector_score = (
++                ((detector_activation - detector_mean) / detector_scale) @ detector_coef + detector_intercept
++            )
++            detected = detector_score > detector_threshold
++
++        def step(carry):
++            x_t, time = carry
++            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++                observation, x_t, jnp.broadcast_to(time, batch_size)
++            )
++            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
++            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
++            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
++            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
++            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
++                [None, suffix_tokens],
++                mask=full_attn_mask,
++                positions=positions,
++                kv_cache=kv_cache,
++                adarms_cond=[None, adarms_cond],
++            )
++            assert prefix_out is None
++            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            return x_t + dt * v_t, time + dt
++
++        def cond(carry):
++            _, time = carry
++            return time >= -dt / 2
++
++        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
++        return x_0, {
++            "probe": {
++                "score": detector_score,
++                "detected": detected,
++                "threshold": detector_threshold,
++                "layer": detector_layer,
++            }
++        }
++
++    def sample_actions_with_sae_multi_ablation_and_activation(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        *,
++        capture_layer: int,
++        ablation_layers: tuple[int, ...],
++        ablation_bases: tuple[tuple[tuple[float, ...], ...], ...],
++        num_steps: int | at.Int[at.Array, ""] = 10,
++        noise: at.Float[at.Array, "b ah ad"] | None = None,
++    ) -> tuple[_model.Actions, dict]:
++        """Project out selected SAE decoder subspaces at multiple PaliGemma layers."""
++        if not ablation_layers or len(ablation_layers) != len(ablation_bases):
++            raise ValueError("ablation_layers and ablation_bases must be non-empty and aligned")
++        observation = _model.preprocess_observation(None, observation, train=False)
++        dt = -1.0 / num_steps
++        batch_size = observation.state.shape[0]
++        if noise is None:
++            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
++
++        hook_config = {
++            "expert": 0,
++            "pool_mean": True,
++            "direction": None,
++            "mode": 0,
++            "ablation_layers": ablation_layers,
++            "ablation_bases": ablation_bases,
++        }
++        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
++        initial_activation = jnp.zeros((batch_size, prefix_tokens.shape[-1]), dtype=prefix_tokens.dtype)
++
++        def step(carry):
++            x_t, time, _ = carry
++            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++                observation, x_t, jnp.broadcast_to(time, batch_size)
++            )
++            input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
++            ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
++            attn_mask = make_attn_mask(input_mask, ar_mask)
++            positions = jnp.cumsum(input_mask, axis=1) - 1
++            (_, suffix_out), _, all_activations = self.PaliGemma.llm(
++                [prefix_tokens, suffix_tokens],
++                mask=attn_mask,
++                positions=positions,
++                adarms_cond=[None, adarms_cond],
++                sae_hook_config=hook_config,
++            )
++            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            return x_t + dt * v_t, time + dt, all_activations[capture_layer]
++
++        def cond(carry):
++            _, time, _ = carry
++            return time >= -dt / 2
++
++        x_0, _, activation = jax.lax.while_loop(cond, step, (noise, 1.0, initial_activation))
++        return x_0, {
++            "sae": {
++                "activations": activation,
++                "layer": capture_layer,
++                "expert": 0,
++                "ablation_layers": ablation_layers,
++            }
++        }
++
++    def sample_actions_with_sae_all(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        *,
++        pool: str | None = "mean",
++        pool_mean: bool | None = None,
++        num_steps: int | at.Int[at.Array, ""] = 10,
++        noise: at.Float[at.Array, "b ah ad"] | None = None,
++    ) -> tuple[_model.Actions, dict]:
++        """Sample actions while collecting all PaliGemma and action-expert layer activations."""
++        observation = _model.preprocess_observation(None, observation, train=False)
++        pool_is_mean = (pool == "mean") if pool_mean is None else pool_mean
++        dt = -1.0 / num_steps
++        batch_size = observation.state.shape[0]
++        if noise is None:
++            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
++
++        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
++        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
++        positions = jnp.cumsum(prefix_mask, axis=1) - 1
++        pg_hook_config = {
++            "layer": -1,
++            "expert": 0,
++            "pool_mean": pool_is_mean,
++            "direction": None,
++            "mode": 0,
++            "alpha": 1.0,
++        }
++        _, kv_cache, pg_activations = self.PaliGemma.llm(
++            [prefix_tokens, None],
++            mask=prefix_attn_mask,
++            positions=positions,
++            sae_hook_config=pg_hook_config,
++        )
++
++        def step(carry):
++            x_t, time = carry
++            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++                observation, x_t, jnp.broadcast_to(time, batch_size)
++            )
++            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
++            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
++            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
++            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
++            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
++                [None, suffix_tokens],
++                mask=full_attn_mask,
++                positions=positions,
++                kv_cache=kv_cache,
++                adarms_cond=[None, adarms_cond],
++            )
++            assert prefix_out is None
++            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            return x_t + dt * v_t, time + dt
++
++        def cond(carry):
++            _, time = carry
++            return time >= -dt / 2
++
++        x_t, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
++        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++            observation, x_t, jnp.zeros((batch_size,), dtype=x_t.dtype)
++        )
++        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
++        prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
++        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
++        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
++        ae_hook_config = {
++            "layer": -1,
++            "expert": 1,
++            "pool_mean": pool_is_mean,
++            "direction": None,
++            "mode": 0,
++            "alpha": 1.0,
++        }
++        (prefix_out, suffix_out), _, ae_activations = self.PaliGemma.llm(
++            [None, suffix_tokens],
++            mask=full_attn_mask,
++            positions=positions,
++            kv_cache=kv_cache,
++            adarms_cond=[None, adarms_cond],
++            sae_hook_config=ae_hook_config,
++        )
++        assert prefix_out is None
++        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++        return x_t + dt * v_t, {"sae": {"pg": pg_activations, "ae": ae_activations, "pool_mean": pool_is_mean}}
++
++    def sample_actions_with_sae_all_mean(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        *,
++        num_steps: int | at.Int[at.Array, ""] = 10,
++        noise: at.Float[at.Array, "b ah ad"] | None = None,
++    ) -> tuple[_model.Actions, dict]:
++        return self.sample_actions_with_sae_all(
++            rng,
++            observation,
++            pool=None,
++            pool_mean=True,
++            num_steps=num_steps,
++            noise=noise,
++        )
+--- a/src/openpi/models/siglip.py
++++ b/src/openpi/models/siglip.py
+@@ -72,6 +72,50 @@
+         return nn.Dense(d, dtype=self.dtype_mm, **inits)(x)
+ 
+ 
++class SelfAttentionWithWeights(nn.Module):
++    """Self-attention compatible with Flax MHDPA params, plus CLS attention summary."""
++
++    num_heads: int = 12
++    dtype_mm: str = "float32"
++
++    @nn.compact
++    def __call__(self, x, *, return_cls_attention_summary=False):
++        features = x.shape[-1]
++        if features % self.num_heads != 0:
++            raise ValueError(f"features={features} must be divisible by num_heads={self.num_heads}.")
++        head_dim = features // self.num_heads
++        dense = lambda name: nn.DenseGeneral(
++            features=(self.num_heads, head_dim),
++            axis=-1,
++            dtype=self.dtype_mm,
++            kernel_init=nn.initializers.xavier_uniform(),
++            bias_init=nn.initializers.zeros_init(),
++            name=name,
++        )
++        query = dense("query")(x)
++        key = dense("key")(x)
++        value = dense("value")(x)
++
++        scale = jnp.sqrt(jnp.asarray(head_dim, dtype=query.dtype))
++        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", query / scale, key)
++        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(query.dtype)
++        attended = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, value)
++        attended = nn.DenseGeneral(
++            features=features,
++            axis=(-2, -1),
++            dtype=self.dtype_mm,
++            kernel_init=nn.initializers.xavier_uniform(),
++            bias_init=nn.initializers.zeros_init(),
++            name="out",
++        )(attended)
++
++        cls_to_patches = None
++        if return_cls_attention_summary:
++            # Shape: [batch, patches]. Average heads for the CLS query, skipping CLS itself.
++            cls_to_patches = jnp.mean(attn_weights[:, :, 0, 1:], axis=1, dtype=jnp.float32)
++        return attended, cls_to_patches
++
++
+ class Encoder1DBlock(nn.Module):
+     """Single transformer encoder block (MHSA + MLP)."""
+ 
+@@ -81,16 +125,25 @@
+     dtype_mm: str = "float32"
+ 
+     @nn.compact
+-    def __call__(self, x, deterministic=True):  # noqa: FBT002
++    def __call__(self, x, deterministic=True, return_cls_attention_summary=False):  # noqa: FBT002
+         out = {}
+         x = sharding.activation_sharding_constraint(x)
+         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
+-        y = out["sa"] = nn.MultiHeadDotProductAttention(
+-            num_heads=self.num_heads,
+-            kernel_init=nn.initializers.xavier_uniform(),
+-            deterministic=deterministic,
+-            dtype=self.dtype_mm,
+-        )(y, y)
++        if return_cls_attention_summary:
++            y, cls_to_patches = SelfAttentionWithWeights(
++                name="MultiHeadDotProductAttention_0",
++                num_heads=self.num_heads,
++                dtype_mm=self.dtype_mm,
++            )(y, return_cls_attention_summary=True)
++            out["cls_to_patches"] = cls_to_patches
++        else:
++            y = nn.MultiHeadDotProductAttention(
++                num_heads=self.num_heads,
++                kernel_init=nn.initializers.xavier_uniform(),
++                deterministic=deterministic,
++                dtype=self.dtype_mm,
++            )(y, y)
++        out["sa"] = y
+         y = sharding.activation_sharding_constraint(y)
+         y = nn.Dropout(rate=self.dropout)(y, deterministic)
+         x = out["+sa"] = x + y
+@@ -120,14 +173,14 @@
+     dtype_mm: str = "float32"
+ 
+     @nn.compact
+-    def __call__(self, x, deterministic=True):  # noqa: FBT002
++    def __call__(self, x, deterministic=True, return_cls_attention_summary=False):  # noqa: FBT002
+         out = {}
+ 
+         if self.scan:
+             block = nn.remat(
+                 Encoder1DBlock,
+                 prevent_cse=False,
+-                static_argnums=(2,),  # 0=self, 2=deterministic
++                static_argnums=(2, 3),  # 0=self, 2=deterministic, 3=return_cls_attention_summary
+                 policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
+             )
+             x, scan_out = nn.scan(
+@@ -142,9 +195,11 @@
+                 mlp_dim=self.mlp_dim,
+                 num_heads=self.num_heads,
+                 dropout=self.dropout,
+-            )(x, deterministic)
++            )(x, deterministic, return_cls_attention_summary)
+             for lyr in range(self.depth):
+                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
++            if return_cls_attention_summary:
++                out["cls_to_patches"] = scan_out["cls_to_patches"][-1]
+         else:
+             # Input Encoder
+             for lyr in range(self.depth):
+@@ -155,7 +210,10 @@
+                     num_heads=self.num_heads,
+                     dropout=self.dropout,
+                 )
+-                x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
++                x, block_out = block_cur(x, deterministic, return_cls_attention_summary)
++                out[f"block{lyr:02d}"] = block_out
++                if return_cls_attention_summary:
++                    out["cls_to_patches"] = block_out["cls_to_patches"]
+             out["pre_ln"] = x  # Alias for last block, but without the number in it.
+ 
+         return nn.LayerNorm(name="encoder_norm", dtype=self.dtype_mm)(x), out
+@@ -205,7 +263,7 @@
+     dtype_mm: str = "float32"
+ 
+     @nn.compact
+-    def __call__(self, image, *, train=False):
++    def __call__(self, image, *, train=False, return_cls_attention_summary=False):
+         out = {}
+ 
+         # Kevin edit: do patch extraction and posemb in float32,
+@@ -228,9 +286,17 @@
+         # Add posemb before adding extra token.
+         x = out["with_posemb"] = x + get_posemb(self, self.posemb, (h, w), c, "pos_embedding", jnp.float32)
+ 
++        synthetic_cls_for_attention = False
+         if self.pool_type == "tok":
+             cls = self.param("cls", nn.initializers.zeros, (1, 1, c), x.dtype)
+             x = jnp.concatenate([jnp.tile(cls, [n, 1, 1]), x], axis=1)
++        elif return_cls_attention_summary:
++            # Pi05 uses pool_type="none", so the normal encoder path has no CLS token.
++            # For introspection only, prepend a zero CLS probe and later discard it
++            # from the patch-token outputs returned to the policy.
++            cls = jnp.zeros((n, 1, c), dtype=x.dtype)
++            x = jnp.concatenate([cls, x], axis=1)
++            synthetic_cls_for_attention = True
+ 
+         n, _, c = x.shape  # n,l,d
+         x = nn.Dropout(rate=self.dropout)(x, not train)
+@@ -247,7 +313,7 @@
+             remat_policy=self.remat_policy,
+             dtype_mm=self.dtype_mm,
+             name="Transformer",
+-        )(x, deterministic=not train)
++        )(x, deterministic=not train, return_cls_attention_summary=return_cls_attention_summary)
+         encoded = out["encoded"] = x
+ 
+         if self.pool_type == "map":
+@@ -263,6 +329,9 @@
+         elif self.pool_type == "tok":
+             x = out["head_input"] = x[:, 0]
+             encoded = encoded[:, 1:]
++        elif synthetic_cls_for_attention:
++            encoded = encoded[:, 1:]
++            x = encoded
+         elif self.pool_type == "none":
+             pass
+         else:

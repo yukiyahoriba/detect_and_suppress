@@ -1,0 +1,102 @@
+{
+  "template_version": 1,
+  "paper": {
+    "condition_id": "patch3_detect_ablate_lambda0p3",
+    "table": null,
+    "table_status": "paper source/table mapping not supplied; author confirmation required",
+    "recorded_legacy_config_sha256": "919804b8a8e74481587bcd357b383439e024d9a6ed399602209a43e4a1310205"
+  },
+  "evaluation": {
+    "schema_version": 1,
+    "model": "pi05",
+    "condition": "patch3_detect_ablate_lambda0p3",
+    "defense": {
+      "detector": {
+        "model": "pi05",
+        "family": "llm",
+        "layer": 0,
+        "capture_point": "PaliGemma transformer block input residual stream",
+        "pooling": "unmasked arithmetic mean over all PaliGemma prefix tokens",
+        "hidden_dim": 2048,
+        "image_keys": [
+          "base_0_rgb"
+        ],
+        "checkpoint": "checkpoint artifact (bound by prepare-evaluation)"
+      },
+      "intervention": {
+        "model": "pi05",
+        "family": "llm",
+        "layer": 5,
+        "capture_point": "PaliGemma transformer block input residual stream",
+        "pooling": "unmasked arithmetic mean over all PaliGemma prefix tokens",
+        "hidden_dim": 2048,
+        "image_keys": [
+          "base_0_rgb"
+        ],
+        "checkpoint": "checkpoint artifact (bound by prepare-evaluation)"
+      },
+      "lambda_": 0.3,
+      "mode": "probe"
+    },
+    "artifacts": {
+      "checkpoint": {
+        "path": "pi05/checkpoint",
+        "sha256": "ca22f9fb29a0fde7ef08147f78a0965381cdc8a28528266bf72762c173ea2568"
+      },
+      "sae": {
+        "path": "pi05/sae.npz",
+        "sha256": "2328b23b67e3e6bba9649f22fc96028822a0876d477bb7cff12b1c4b5335c74e"
+      },
+      "probe": {
+        "path": "pi05/probe.npz",
+        "sha256": "6beb71d36980c86fe5702e6f1808f3ebaf011c3d7045eb5a1c527c45f2f0f1c5"
+      },
+      "patch": {
+        "path": "pi05/patch.png",
+        "sha256": "d62fee7a434c9c28177805c190142af18933e12dd562969534d431a7452705fa"
+      },
+      "selection": {
+        "path": "pi05/selection.json",
+        "sha256": "9ccbf75fd3378ee186824f7e5e4b9fbc7257a4913db0bc56158bb8d702b3bb94"
+      }
+    },
+    "feature_id": 902,
+    "seed": 1,
+    "overlay_seed": 1,
+    "patch_mode": "bursts",
+    "patch_windows": 3,
+    "patch_window_frames": 10,
+    "replan_steps": 5,
+    "denoising_steps": 10,
+    "num_steps_wait": 10,
+    "max_steps": 520,
+    "resize_size": 224,
+    "config_name": "pi05_libero",
+    "timing": "prefix",
+    "task_suite": "libero_10",
+    "episodes_per_task": 50,
+    "provenance": null,
+    "protocol": {
+      "version": 1,
+      "environment_resolution": 256,
+      "patch_geometry": {
+        "min_scale": 0.61,
+        "max_scale": 1.39,
+        "max_rotation_deg": 30.0,
+        "max_shear": 0.2,
+        "no_geometry_prob": 0.2
+      },
+      "patch_geometry_scope": "episode",
+      "shared_camera_geometry": true,
+      "non_overlapping_windows": true,
+      "patch_cameras": [
+        "agent"
+      ],
+      "schedule_horizon": 520,
+      "schedule_unit": "environment_step",
+      "queue_flush_on_visibility_change": true,
+      "success_rule": "done",
+      "noise_scheme": "jax.fold_in(seed, rollout_id); split once per policy forward"
+    }
+  }
+}

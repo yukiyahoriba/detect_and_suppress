@@ -1,0 +1,99 @@
+{
+  "template_version": 1,
+  "paper": {
+    "condition_id": "patch3_detect_layer0_lambda0p2",
+    "table": null,
+    "table_status": "paper source/table mapping not supplied; author confirmation required",
+    "recorded_legacy_config_sha256": "769f5743f355b6a37696b8e48b94c3903056c623a4d718847db5820d359d1cd9"
+  },
+  "evaluation": {
+    "schema_version": 1,
+    "model": "smolvla",
+    "condition": "patch3_detect_layer0_lambda0p2",
+    "defense": {
+      "detector": {
+        "model": "smolvla",
+        "family": "vlm",
+        "layer": 0,
+        "capture_point": "VLM block input_layernorm input (pre-RMSNorm residual)",
+        "pooling": "FP32 masked mean over all valid prefix tokens",
+        "hidden_dim": 960,
+        "image_keys": [],
+        "checkpoint": "checkpoint artifact (bound by prepare-evaluation)"
+      },
+      "intervention": {
+        "model": "smolvla",
+        "family": "vlm",
+        "layer": 9,
+        "capture_point": "VLM block input_layernorm input (pre-RMSNorm residual)",
+        "pooling": "FP32 masked mean over all valid prefix tokens",
+        "hidden_dim": 960,
+        "image_keys": [],
+        "checkpoint": "checkpoint artifact (bound by prepare-evaluation)"
+      },
+      "lambda_": 0.2,
+      "mode": "probe"
+    },
+    "artifacts": {
+      "checkpoint": {
+        "path": "smolvla/checkpoint",
+        "sha256": "4c18d39c74af6f7d73ee0e9565bdbf390bd0f2d63e9e501a574f3977a18b506a"
+      },
+      "sae": {
+        "path": "smolvla/sae.npz",
+        "sha256": "48f3c8726e03d7939fbe76ad25be7eaefcb168d61821934aa68d415b343b6515"
+      },
+      "probe": {
+        "path": "smolvla/probe.npz",
+        "sha256": "1ef68f6bdc67a88d6e06321ea66576bb39efe8f041794c9aed4f32e2f1b80a1c"
+      },
+      "patch": {
+        "path": "smolvla/patch.png",
+        "sha256": "b12907740f8d9fb9d2d5abbce93e4218cd7d039e689e016827588af05461edc1"
+      },
+      "selection": {
+        "path": "smolvla/selection.json",
+        "sha256": "880c16c7916f99c89c37263d49c5d025352eadfc8d197011e63e7acfcabdd381"
+      }
+    },
+    "feature_id": 123,
+    "seed": 1,
+    "overlay_seed": 1,
+    "patch_mode": "bursts",
+    "patch_windows": 3,
+    "patch_window_frames": 10,
+    "replan_steps": 1,
+    "denoising_steps": 10,
+    "num_steps_wait": 10,
+    "max_steps": 520,
+    "resize_size": 224,
+    "config_name": "pi05_libero",
+    "timing": "prefix",
+    "task_suite": "libero_10",
+    "episodes_per_task": 50,
+    "provenance": null,
+    "protocol": {
+      "version": 1,
+      "environment_resolution": 256,
+      "patch_geometry": {
+        "min_scale": 0.61,
+        "max_scale": 1.39,
+        "max_rotation_deg": 30.0,
+        "max_shear": 0.2,
+        "no_geometry_prob": 0.2
+      },
+      "patch_geometry_scope": "episode",
+      "shared_camera_geometry": true,
+      "non_overlapping_windows": true,
+      "patch_cameras": [
+        "agent",
+        "wrist"
+      ],
+      "schedule_horizon": 90,
+      "schedule_unit": "environment_step",
+      "queue_flush_on_visibility_change": false,
+      "success_rule": "info.is_success",
+      "noise_scheme": "torch CPU/CUDA seed + rollout_id before reset; CUDA randn once per policy forward"
+    }
+  }
+}

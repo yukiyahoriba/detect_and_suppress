@@ -1,0 +1,204 @@
+--- a/src/openpi/models/gemma.py
++++ b/src/openpi/models/gemma.py
+@@ -46,6 +46,9 @@
+ def _sae_apply_hook(xs, layer_idx, hook_config: dict[str, Any] | None):
+     if hook_config is None:
+         return xs, None
++    if hook_config.get("defense_integration", False):
++        from detect_and_suppress.adapters.pi05_hooks import apply_defense_hook
++        return apply_defense_hook(xs, layer_idx, hook_config)
+     expert = int(_sae_cfg_get(hook_config, 'expert', 0))
+     x = xs[expert]
+     if x is None:
+@@ -527,7 +530,7 @@
+     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache] | tuple[
+         Sequence[at.Float[at.Array, "b _t _d"] | None],
+         KVCache,
+-        at.Float[at.Array, "..."] | None,
++        at.Float[at.Array, "..."] | dict[str, Any] | None,
+     ]:
+         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
+         mask = jnp.asarray(mask)[:, None, :, :]
+--- a/src/openpi/models/pi0.py
++++ b/src/openpi/models/pi0.py
+@@ -734,6 +734,11 @@
+         intervention_active: bool | at.Bool[at.Array, ""] = True,
+         num_steps: int | at.Int[at.Array, ""] = 10,
+         noise: at.Float[at.Array, "b ah ad"] | None = None,
++        defense_mode: str | None = None,
++        defense_active=None,
++        capture_defense: bool = False,
++        defense_probe=None,
++        defense_detector_layer: int = 0,
+     ) -> tuple[_model.Actions, dict]:
+         """Apply paper-style steering and return the final hooked pre-intervention activation.
+ 
+@@ -759,9 +764,22 @@
+             "alpha": alpha,
+             "intervention_active": intervention_active,
+         }
++        if defense_mode is not None:
++            hook_config.update(defense_integration=True, defense_mode=defense_mode, defense_active=defense_active,
++                               capture_defense=capture_defense, detector_layer=defense_detector_layer,
++                               detector_mean=defense_probe["mean"], detector_scale=defense_probe["scale"],
++                               detector_coef=defense_probe["coef"], detector_intercept=defense_probe["intercept"],
++                               detector_threshold=defense_probe["threshold"])
+         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+         activation_dim = len(direction)
+         initial_activation = jnp.zeros((batch_size, activation_dim), dtype=prefix_tokens.dtype)
++        if defense_mode is not None:
++            tokens = prefix_tokens.shape[1] if capture_defense else 0
++            initial_activation = {"activations": initial_activation,
++                                  "detector": jnp.zeros((batch_size, activation_dim), dtype=jnp.float32),
++                                  "before": jnp.zeros((batch_size, tokens, activation_dim), dtype=prefix_tokens.dtype),
++                                  "after": jnp.zeros((batch_size, tokens, activation_dim), dtype=prefix_tokens.dtype),
++                                  "applied": jnp.zeros((batch_size,), dtype=jnp.bool_)}
+ 
+         def step(carry):
+             x_t, time, _ = carry
+@@ -780,13 +798,24 @@
+                 sae_hook_config=hook_config,
+             )
+             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+-            return x_t + dt * v_t, time + dt, all_activations[layer]
++            capture = all_activations[layer] if defense_mode is None else {
++                "activations": all_activations["pooled"][layer],
++                "detector": all_activations["pooled"][defense_detector_layer].astype(jnp.float32),
++                **{key: all_activations[key][layer] for key in ("before", "after", "applied")},
++            }
++            return x_t + dt * v_t, time + dt, capture
+ 
+         def cond(carry):
+             _, time, _ = carry
+             return time >= -dt / 2
+ 
+         x_0, _, activation = jax.lax.while_loop(cond, step, (noise, 1.0, initial_activation))
++        if defense_mode is not None:
++            score = ((activation["detector"] - defense_probe["mean"]) / defense_probe["scale"]) @ defense_probe["coef"] + defense_probe["intercept"]
++            return x_0, {"probe": {"score": score, "detected": score > defense_probe["threshold"],
++                                     "threshold": defense_probe["threshold"], "layer": defense_detector_layer},
++                         "defense": {key: activation[key] for key in ("before", "after", "applied")},
++                         "sae": {"activations": activation["activations"], "layer": layer, "expert": expert}}
+         return x_0, {"sae": {"activations": activation, "layer": layer, "expert": expert}}
+ 
+     def sample_actions_with_vit_probe_gated_sae_steering(
+@@ -807,6 +836,10 @@
+         alpha: float = 1.0,
+         num_steps: int | at.Int[at.Array, ""] = 10,
+         noise: at.Float[at.Array, "b ah ad"] | None = None,
++        defense_mode: str | None = None,
++        defense_active=None,
++        capture_defense: bool = False,
++        defense_image_keys: tuple[str, ...] = ("base_0_rgb",),
+     ) -> tuple[_model.Actions, dict]:
+         """Detect from a ViT post-block residual and gate PG SAE steering in one forward."""
+         if direction is None:
+@@ -823,15 +856,22 @@
+         ar_mask = []
+         tokens = []
+         detector_activation = None
++        detector_views = {}
+         for name in observation.images:
+             image_tokens, details = self.PaliGemma.img(observation.images[name], train=False)
+             tokens.append(image_tokens)
+             input_mask.append(einops.repeat(observation.image_masks[name], "b -> b s", s=image_tokens.shape[1]))
+             ar_mask += [False] * image_tokens.shape[1]
++            if defense_mode is not None and name in defense_image_keys:
++                detector_views[name] = jnp.mean(details["encoder"][f"block{detector_layer:02d}"]["+mlp"], axis=1, dtype=jnp.float32)
+             if name == "base_0_rgb":
+                 detector_activation = jnp.mean(
+                     details["encoder"][f"block{detector_layer:02d}"]["+mlp"], axis=1, dtype=jnp.float32
+                 )
++        if defense_mode is not None:
++            if not defense_image_keys or set(defense_image_keys).difference(detector_views):
++                raise ValueError("missing detector image streams")
++            detector_activation = jnp.concatenate([detector_views[key] for key in defense_image_keys], axis=-1)
+         if detector_activation is None:
+             raise ValueError("base_0_rgb is required for the ViT detector")
+         if observation.tokenized_prompt is not None:
+@@ -856,9 +896,13 @@
+             "alpha": alpha,
+             "intervention_active": detected[:, None, None],
+         }
++        if defense_mode is not None:
++            hook_config.update(defense_integration=True, defense_mode=defense_mode,
++                               defense_active=defense_active, capture_defense=capture_defense)
++
+         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+         positions = jnp.cumsum(prefix_mask, axis=1) - 1
+-        _, kv_cache, _ = self.PaliGemma.llm(
++        _, kv_cache, all_activations = self.PaliGemma.llm(
+             [prefix_tokens, None],
+             mask=prefix_attn_mask,
+             positions=positions,
+@@ -890,7 +934,7 @@
+             return time >= -dt / 2
+ 
+         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+-        return x_0, {
++        extras = {
+             "probe": {
+                 "score": detector_score,
+                 "detected": detected,
+@@ -898,6 +942,10 @@
+                 "layer": detector_layer,
+             }
+         }
++
++        if defense_mode is not None:
++            extras["defense"] = {key: all_activations[key][layer] for key in ("before", "after", "applied")}
++        return x_0, extras
+ 
+     def sample_actions_with_probe_gated_sae_steering(
+         self,
+@@ -917,6 +965,9 @@
+         alpha: float = 1.0,
+         num_steps: int | at.Int[at.Array, ""] = 10,
+         noise: at.Float[at.Array, "b ah ad"] | None = None,
++        defense_mode: str | None = None,
++        defense_active=None,
++        capture_defense: bool = False,
+     ) -> tuple[_model.Actions, dict]:
+         """Probe a PG residual stream and gate an SAE intervention in the same prefix forward."""
+         if direction is None:
+@@ -960,6 +1011,10 @@
+             **detector_hook_config,
+         }
+ 
++        if defense_mode is not None:
++            hook_config.update(defense_integration=True, defense_mode=defense_mode,
++                               defense_active=defense_active, capture_defense=capture_defense)
++
+         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+         positions = jnp.cumsum(prefix_mask, axis=1) - 1
+         _, kv_cache, all_activations = self.PaliGemma.llm(
+@@ -969,7 +1024,8 @@
+             sae_hook_config=hook_config,
+         )
+         if detector_layer != 0:
+-            detector_activation = all_activations[detector_layer].astype(jnp.float32)
++            detector_activation = (all_activations["pooled"][detector_layer] if defense_mode is not None
++                                   else all_activations[detector_layer]).astype(jnp.float32)
+             detector_score = (
+                 ((detector_activation - detector_mean) / detector_scale) @ detector_coef + detector_intercept
+             )
+@@ -1000,7 +1056,7 @@
+             return time >= -dt / 2
+ 
+         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+-        return x_0, {
++        extras = {
+             "probe": {
+                 "score": detector_score,
+                 "detected": detected,
+@@ -1008,6 +1064,10 @@
+                 "layer": detector_layer,
+             }
+         }
++
++        if defense_mode is not None:
++            extras["defense"] = {key: all_activations[key][layer] for key in ("before", "after", "applied")}
++        return x_0, extras
+ 
+     def sample_actions_with_sae_multi_ablation_and_activation(
+         self,

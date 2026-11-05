@@ -1,0 +1,31 @@
+{
+  "openpi_revision": "981483dca0fd9acba698fea00aa6e52d56a66c58",
+  "openpi": {
+    "src/openpi/models/gemma.py": {
+      "upstream": "7e42ada4ae7e9995f0ef3e33a0c224758323c2015e2d9d72ec15726a8a001d2a",
+      "research": "7e329b95f396adacbf3bf1c69af32b436303c0703996f13b59fd36b1ba201a9b",
+      "integrated": "7138971d8a8500bd2fc9c61489107ceecd13b00649740b824a55c6137e967105"
+    },
+    "src/openpi/models/pi0.py": {
+      "upstream": "24b32d7c6ed5e409459afa8ca5af96a4dae09c2dcdf48e828907e411f4f12342",
+      "research": "23b033e58592e4d1102b5b188fde5d017809ccb0a40d1d91baaf442d83aacd2e",
+      "integrated": "bdb4c96ff00b293b42182766f1fa320f3f279b62fd5e447d08efd0a0f4d014ad"
+    },
+    "src/openpi/models/siglip.py": {
+      "upstream": "14b4df0be280d5769fb0dc31a40cde27525dbb1980cc998c28475d62fa3cad32",
+      "research": "85f9bf364baf64617f790adcd1ac92c0b90dd401d94a7f2e44d7086c27f62ef2",
+      "integrated": "85f9bf364baf64617f790adcd1ac92c0b90dd401d94a7f2e44d7086c27f62ef2"
+    }
+  },
+  "smolvla_revision": "5865170d36442b907bb35f946e837eee18aafdf1",
+  "smolvla": {
+    "src/lerobot/policies/smolvla/modeling_smolvla.py": {
+      "upstream": "5d9ef1a36bdbbf77c8f9c07fb36b70259645ff10ae19492c5889410130c46f01",
+      "research": "d233190ecf85a0d67cfbcdf85e9ea186418ea5355c2f72fcfcc9d808fead20e7"
+    },
+    "src/lerobot/policies/smolvla/smolvlm_with_expert.py": {
+      "upstream": "ce728a4becd56951db2cb75bfca5e8822a280e7616b1d1f95d4b86ae62ea84a8",
+      "research": "5defa2418e821044840d9d71ad70c2b38cb06c1bfbfc545e8460db1a26e0bf45"
+    }
+  }
+}

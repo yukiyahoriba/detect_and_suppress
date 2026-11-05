@@ -1,0 +1,682 @@
+diff --git a/src/lerobot/envs/configs.py b/src/lerobot/envs/configs.py
+index 9c1c083a..8b2da06a 100644
+--- a/src/lerobot/envs/configs.py
++++ b/src/lerobot/envs/configs.py
+@@ -271,6 +271,38 @@ class LiberoEnv(EnvConfig):
+     camera_name_mapping: dict[str, str] | None = None
+     observation_height: int = 360
+     observation_width: int = 360
++    use_patch: bool = False
++    patch_image: str | None = None
++    patch_size: tuple[int, int] = (0, 0)
++    patch_in_sim: bool = False
++    patch_texture_path: str | None = None
++    patch_size_m: tuple[float, float] = (0.15, 0.15)
++    patch_thickness_m: float = 0.0005
++    patch_margin_m: float = 0.02
++    patch_clearance_m: float = 0.06
++    patch_max_tries: int = 200
++    patch_texture_mode: str = "2d"
++    patch_texture_res: int = 512
++    patch_texture_rotate: int = 0
++    patch_token_grid_size: int = 16
++    patch_token_span: int = 4
++    patch_snap_to_token_grid: bool = True
++    patch_placement: str = "preset"
++    patch_x: int = 2
++    patch_y: int = 2
++    patch_angle: float = 0.0
++    patch_shx: float = 0.0
++    patch_shy: float = 0.0
++    patch_alpha: float = 1.0
++    patch_cameras: str = "both"
++    patch_sync_wrist_with_agent: bool = True
++    patch_random_scale_min: float = 0.61
++    patch_random_scale_max: float = 1.39
++    patch_random_geom: bool = True
++    patch_random_angle_max: float = 30.0
++    patch_random_shx_max: float = 0.2
++    patch_random_shy_max: float = 0.2
++    patch_seed: int | None = None
+     features: dict[str, PolicyFeature] = field(
+         default_factory=lambda: {
+             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+@@ -340,7 +372,42 @@ class LiberoEnv(EnvConfig):
+ 
+     @property
+     def gym_kwargs(self) -> dict:
+-        kwargs: dict[str, Any] = {"obs_type": self.obs_type, "render_mode": self.render_mode}
++        kwargs: dict[str, Any] = {
++            "obs_type": self.obs_type,
++            "render_mode": self.render_mode,
++            "use_patch": self.use_patch,
++            "patch_image": self.patch_image,
++            "patch_size": self.patch_size,
++            "patch_in_sim": self.patch_in_sim,
++            "patch_texture_path": self.patch_texture_path,
++            "patch_size_m": self.patch_size_m,
++            "patch_thickness_m": self.patch_thickness_m,
++            "patch_margin_m": self.patch_margin_m,
++            "patch_clearance_m": self.patch_clearance_m,
++            "patch_max_tries": self.patch_max_tries,
++            "patch_texture_mode": self.patch_texture_mode,
++            "patch_texture_res": self.patch_texture_res,
++            "patch_texture_rotate": self.patch_texture_rotate,
++            "patch_token_grid_size": self.patch_token_grid_size,
++            "patch_token_span": self.patch_token_span,
++            "patch_snap_to_token_grid": self.patch_snap_to_token_grid,
++            "patch_placement": self.patch_placement,
++            "patch_x": self.patch_x,
++            "patch_y": self.patch_y,
++            "patch_angle": self.patch_angle,
++            "patch_shx": self.patch_shx,
++            "patch_shy": self.patch_shy,
++            "patch_alpha": self.patch_alpha,
++            "patch_cameras": self.patch_cameras,
++            "patch_sync_wrist_with_agent": self.patch_sync_wrist_with_agent,
++            "patch_random_scale_min": self.patch_random_scale_min,
++            "patch_random_scale_max": self.patch_random_scale_max,
++            "patch_random_geom": self.patch_random_geom,
++            "patch_random_angle_max": self.patch_random_angle_max,
++            "patch_random_shx_max": self.patch_random_shx_max,
++            "patch_random_shy_max": self.patch_random_shy_max,
++            "patch_seed": self.patch_seed,
++        }
+         if self.task_ids is not None:
+             kwargs["task_ids"] = self.task_ids
+         return kwargs
+diff --git a/src/lerobot/envs/libero.py b/src/lerobot/envs/libero.py
+index d20dae8e..bb98426e 100644
+--- a/src/lerobot/envs/libero.py
++++ b/src/lerobot/envs/libero.py
+@@ -15,9 +15,13 @@
+ # limitations under the License.
+ from __future__ import annotations
+ 
++import logging
++import math
+ import os
++import random
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Mapping, Sequence
++from dataclasses import dataclass
+ from functools import partial
+ from pathlib import Path
+ from typing import Any
+@@ -28,6 +32,7 @@ import torch
+ from gymnasium import spaces
+ from libero.libero import benchmark, get_libero_path
+ from libero.libero.envs import OffScreenRenderEnv
++from PIL import Image
+ 
+ from lerobot.processor import RobotObservation
+ 
+@@ -85,6 +90,8 @@ def get_libero_dummy_action():
+ ACTION_DIM = 7
+ ACTION_LOW = -1.0
+ ACTION_HIGH = 1.0
++_PATCH_AGENT_CAMERA = "agentview_image"
++_PATCH_WRIST_CAMERA = "robot0_eye_in_hand_image"
+ TASK_SUITE_MAX_STEPS: dict[str, int] = {
+     "libero_spatial": 280,  # longest training demo has 193 steps
+     "libero_object": 280,  # longest training demo has 254 steps
+@@ -94,8 +101,118 @@ TASK_SUITE_MAX_STEPS: dict[str, int] = {
+ }
+ 
+ 
++@dataclass
++class _PatchEpisode:
++    patch: Image.Image
++    position: tuple[int, int]
++    angle: float
++    shx: float
++    shy: float
++    scale: float
++
++
++def _compute_patch_position(
++    placement_mode: str,
++    img_shape: tuple[int, int],
++    patch_shape: tuple[int, int],
++    default_xy: tuple[int, int],
++    rng: random.Random,
++) -> tuple[int, int]:
++    img_h, img_w = img_shape
++    patch_h, patch_w = patch_shape
++    max_x = max(img_w - patch_w, 0)
++    max_y = max(img_h - patch_h, 0)
++    placement_mode = (placement_mode or "preset").lower()
++
++    if placement_mode == "random":
++        x = rng.randint(0, max_x) if max_x > 0 else 0
++        y = rng.randint(0, max_y) if max_y > 0 else 0
++    elif placement_mode == "top_left":
++        x, y = 0, 0
++    elif placement_mode == "top_right":
++        x, y = max_x, 0
++    elif placement_mode == "bottom_left":
++        x, y = 0, max_y
++    elif placement_mode == "bottom_right":
++        x, y = max_x, max_y
++    elif placement_mode == "center":
++        x = max((img_w - patch_w) // 2, 0)
++        y = max((img_h - patch_h) // 2, 0)
++    else:
++        x = default_xy[0] if default_xy is not None else 0
++        y = default_xy[1] if default_xy is not None else 0
++        x = min(max(x, 0), max_x)
++        y = min(max(y, 0), max_y)
++    return int(x), int(y)
++
++
++def _affine_coeffs(angle_deg: float, shx: float, shy: float, center: tuple[float, float]) -> tuple[float, ...]:
++    angle = math.radians(angle_deg)
++    cos_a = math.cos(angle)
++    sin_a = math.sin(angle)
++    rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=float)
++    shear = np.array([[1.0, shx], [shy, 1.0]], dtype=float)
++    mat = shear @ rot
++    cx, cy = center
++    transform = np.array(
++        [
++            [mat[0, 0], mat[0, 1], cx - mat[0, 0] * cx - mat[0, 1] * cy],
++            [mat[1, 0], mat[1, 1], cy - mat[1, 0] * cx - mat[1, 1] * cy],
++            [0.0, 0.0, 1.0],
++        ],
++        dtype=float,
++    )
++    inv = np.linalg.inv(transform)
++    return (
++        float(inv[0, 0]),
++        float(inv[0, 1]),
++        float(inv[0, 2]),
++        float(inv[1, 0]),
++        float(inv[1, 1]),
++        float(inv[1, 2]),
++    )
++
++
++def _normalize_patch_size(
++    patch_size: tuple[int, int] | None,
++    default_size: tuple[int, int],
++) -> tuple[int, int]:
++    if patch_size is None:
++        return default_size
++    if patch_size[0] <= 0 or patch_size[1] <= 0:
++        return default_size
++    return patch_size
++
++
++def _token_tile_size(img_shape: tuple[int, int], token_grid_size: int) -> tuple[int, int]:
++    img_h, img_w = img_shape
++    grid = max(int(token_grid_size), 1)
++    return max(1, img_w // grid), max(1, img_h // grid)
++
++
++def _snap_patch_position_to_grid(
++    position: tuple[int, int],
++    img_shape: tuple[int, int],
++    patch_shape: tuple[int, int],
++    token_grid_size: int,
++) -> tuple[int, int]:
++    img_h, img_w = img_shape
++    patch_h, patch_w = patch_shape
++    step_w, step_h = _token_tile_size((img_h, img_w), token_grid_size)
++
++    x, y = int(position[0]), int(position[1])
++    x = int(round(x / step_w) * step_w) if step_w > 0 else x
++    y = int(round(y / step_h) * step_h) if step_h > 0 else y
++
++    max_x = max(img_w - patch_w, 0)
++    max_y = max(img_h - patch_h, 0)
++    x = min(max(x, 0), max_x)
++    y = min(max(y, 0), max_y)
++    return x, y
++
++
+ class LiberoEnv(gym.Env):
+-    metadata = {"render_modes": ["rgb_array"], "render_fps": 80}
++    metadata = {"render_modes": ["rgb_array"], "render_fps": 30}    # 80
+ 
+     def __init__(
+         self,
+@@ -116,6 +233,38 @@ class LiberoEnv(gym.Env):
+         camera_name_mapping: dict[str, str] | None = None,
+         num_steps_wait: int = 10,
+         control_mode: str = "relative",
++        use_patch: bool = False,
++        patch_image: str | None = None,
++        patch_size: tuple[int, int] = (0, 0),
++        patch_in_sim: bool = False,
++        patch_texture_path: str | None = None,
++        patch_size_m: tuple[float, float] = (0.15, 0.15),
++        patch_thickness_m: float = 0.0005,
++        patch_margin_m: float = 0.02,
++        patch_clearance_m: float = 0.06,
++        patch_max_tries: int = 200,
++        patch_texture_mode: str = "2d",
++        patch_texture_res: int = 512,
++        patch_texture_rotate: int = 0,
++        patch_token_grid_size: int = 16,
++        patch_token_span: int = 4,
++        patch_snap_to_token_grid: bool = True,
++        patch_placement: str = "preset",
++        patch_x: int = 2,
++        patch_y: int = 2,
++        patch_angle: float = 0.0,
++        patch_shx: float = 0.0,
++        patch_shy: float = 0.0,
++        patch_alpha: float = 1.0,
++        patch_cameras: str = "both",
++        patch_sync_wrist_with_agent: bool = True,
++        patch_random_scale_min: float = 0.61,
++        patch_random_scale_max: float = 1.39,
++        patch_random_geom: bool = True,
++        patch_random_angle_max: float = 30.0,
++        patch_random_shx_max: float = 0.2,
++        patch_random_shy_max: float = 0.2,
++        patch_seed: int | None = None,
+     ):
+         super().__init__()
+         self.task_id = task_id
+@@ -144,6 +293,45 @@ class LiberoEnv(gym.Env):
+         self.num_steps_wait = num_steps_wait
+         self.episode_index = episode_index
+         self.episode_length = episode_length
++        self.use_patch = bool(use_patch)
++        self.patch_size = tuple(int(v) for v in patch_size)
++        self.patch_in_sim = bool(patch_in_sim)
++        self.patch_texture_path = patch_texture_path
++        self.patch_size_m = tuple(float(v) for v in patch_size_m)
++        self.patch_thickness_m = float(patch_thickness_m)
++        self.patch_margin_m = float(patch_margin_m)
++        self.patch_clearance_m = float(patch_clearance_m)
++        self.patch_max_tries = int(patch_max_tries)
++        self.patch_texture_mode = str(patch_texture_mode).lower()
++        self.patch_texture_res = int(patch_texture_res)
++        self.patch_texture_rotate = int(patch_texture_rotate)
++        self.patch_token_grid_size = int(patch_token_grid_size)
++        self.patch_token_span = int(patch_token_span)
++        self.patch_snap_to_token_grid = bool(patch_snap_to_token_grid)
++        self.patch_image = patch_image
++        self.patch_placement = str(patch_placement)
++        self.patch_x = int(patch_x)
++        self.patch_y = int(patch_y)
++        self.patch_angle = float(patch_angle)
++        self.patch_shx = float(patch_shx)
++        self.patch_shy = float(patch_shy)
++        self.patch_alpha = float(patch_alpha)
++        self.patch_cameras = str(patch_cameras).lower()
++        self.patch_sync_wrist_with_agent = bool(patch_sync_wrist_with_agent)
++        self.patch_random_scale_min = float(patch_random_scale_min)
++        self.patch_random_scale_max = float(patch_random_scale_max)
++        self.patch_random_geom = bool(patch_random_geom)
++        self.patch_random_angle_max = float(patch_random_angle_max)
++        self.patch_random_shx_max = float(patch_random_shx_max)
++        self.patch_random_shy_max = float(patch_random_shy_max)
++        self.patch_seed = patch_seed
++        if self.use_patch and self.patch_in_sim:
++            raise ValueError("Image-space patching (`use_patch`) and scene-space patching (`patch_in_sim`) are mutually exclusive.")
++        self._patch_reset_count = 0
++        self._patch_rng: random.Random | None = None
++        self._patch_episode_agent: _PatchEpisode | None = None
++        self._patch_episode_wrist: _PatchEpisode | None = None
++        self._patch_base_image: Image.Image | None = None
+         # Load once and keep
+         self._init_states = get_task_init_states(task_suite, self.task_id) if self.init_states else None
+         self._reset_stride = n_envs  # when performing a reset, append `_reset_stride` to `init_state_id`.
+@@ -158,6 +346,7 @@ class LiberoEnv(gym.Env):
+             else self.episode_length
+         )
+         self.control_mode = control_mode
++        self._configure_patch()
+         images = {}
+         for cam in self.camera_name:
+             images[self.camera_name_mapping[cam]] = spaces.Box(
+@@ -222,10 +411,258 @@ class LiberoEnv(gym.Env):
+         )
+ 
+     def render(self):
++        return self.render_video_stream("agent")
++
++    def get_video_streams(self) -> list[str]:
++        return ["agent", "wrist"]
++
++    def render_video_stream(self, stream: str = "agent") -> np.ndarray:
+         raw_obs = self._env.env._get_observations()
+-        image = self._format_raw_obs(raw_obs)["pixels"]["image"]
+-        image = image[::-1, ::-1]  # flip both H and W for visualization
+-        return image
++        raw_images = {camera_name: raw_obs[camera_name] for camera_name in self.camera_name}
++        if self.use_patch:
++            raw_images = self._apply_patch_to_images(raw_images)
++
++        if stream in {"agent", "image", _PATCH_AGENT_CAMERA}:
++            image = raw_images[_PATCH_AGENT_CAMERA]
++        elif stream in {"wrist", "image2", _PATCH_WRIST_CAMERA}:
++            image = raw_images[_PATCH_WRIST_CAMERA]
++        else:
++            raise ValueError(f"Unknown LIBERO video stream: {stream}")
++
++        return image[::-1, ::-1]  # flip both H and W for visualization
++
++    def _resolve_patch_image_path(self, patch_image: str) -> Path:
++        candidate = Path(patch_image).expanduser()
++        if candidate.is_absolute() and candidate.exists():
++            return candidate
++
++        cwd_candidate = Path.cwd() / candidate
++        if cwd_candidate.exists():
++            return cwd_candidate.resolve()
++
++        repo_root = Path(__file__).resolve().parents[5]
++        repo_candidate = repo_root / candidate
++        if repo_candidate.exists():
++            return repo_candidate.resolve()
++
++        raise FileNotFoundError(f"Patch image not found: {patch_image}")
++
++    def _configure_patch(self) -> None:
++        if not self.use_patch:
++            return
++        if self.patch_cameras not in {"agent", "wrist", "both"}:
++            logging.warning("Unknown patch_cameras=%s; defaulting to both.", self.patch_cameras)
++            self.patch_cameras = "both"
++        if self.patch_sync_wrist_with_agent and self.patch_cameras != "both":
++            logging.warning(
++                "patch_sync_wrist_with_agent is only valid with patch_cameras=both; disabling sync."
++            )
++            self.patch_sync_wrist_with_agent = False
++        if self.patch_image is None:
++            raise ValueError("use_patch=True requires patch_image to be set.")
++
++        patch_path = self._resolve_patch_image_path(self.patch_image)
++        self._patch_base_image = Image.open(patch_path).convert("RGBA")
++        logging.info(
++            "LIBERO patch config: image=%s placement=%s cameras=%s size=%s alpha=%.3f seed=%s",
++            patch_path,
++            self.patch_placement,
++            self.patch_cameras,
++            self.patch_size,
++            self.patch_alpha,
++            self.patch_seed,
++        )
++
++    def _reset_patch_state(self, seed: int | None) -> None:
++        self._patch_episode_agent = None
++        self._patch_episode_wrist = None
++        if not self.use_patch:
++            self._patch_rng = None
++            return
++
++        base_seed = self.patch_seed if self.patch_seed is not None else (0 if seed is None else int(seed))
++        rng_seed = int(base_seed) + self.episode_index + (self._patch_reset_count * 9973)
++        self._patch_rng = random.Random(rng_seed)
++        self._patch_reset_count += 1
++
++    def _prepare_patch_for_episode(
++        self,
++        base_patch: Image.Image,
++        img_shape: tuple[int, int],
++        rng: random.Random,
++    ) -> _PatchEpisode:
++        img_h, img_w = img_shape
++        placement_mode = (self.patch_placement or "preset").lower()
++        step_w, step_h = _token_tile_size((img_h, img_w), self.patch_token_grid_size)
++        token_span = max(int(self.patch_token_span), 1)
++        grid_target_w = step_w * token_span
++        grid_target_h = step_h * token_span
++        base_w, base_h = _normalize_patch_size(self.patch_size, (grid_target_w, grid_target_h))
++
++        scale = 1.0
++        if placement_mode == "random":
++            min_scale = min(self.patch_random_scale_min, self.patch_random_scale_max)
++            max_scale = max(self.patch_random_scale_min, self.patch_random_scale_max)
++            scale = rng.uniform(min_scale, max_scale)
++
++        target_w = max(1, int(round(base_w * scale)))
++        target_h = max(1, int(round(base_h * scale)))
++
++        if target_w > img_w or target_h > img_h:
++            fit_scale = min(img_w / max(target_w, 1), img_h / max(target_h, 1))
++            if fit_scale < 1.0:
++                target_w = max(1, int(round(target_w * fit_scale)))
++                target_h = max(1, int(round(target_h * fit_scale)))
++
++        patch = base_patch.resize((target_w, target_h), resample=Image.BICUBIC)
++
++        angle = self.patch_angle
++        shx = self.patch_shx
++        shy = self.patch_shy
++        if placement_mode == "random" and self.patch_random_geom:
++            if rng.random() < 0.2:
++                angle = 0.0
++                shx = 0.0
++                shy = 0.0
++            else:
++                angle = rng.uniform(-self.patch_random_angle_max, self.patch_random_angle_max)
++                shx = rng.uniform(-self.patch_random_shx_max, self.patch_random_shx_max)
++                shy = rng.uniform(-self.patch_random_shy_max, self.patch_random_shy_max)
++
++        if angle != 0.0 or shx != 0.0 or shy != 0.0:
++            coeffs = _affine_coeffs(angle, shx, shy, (target_w / 2.0, target_h / 2.0))
++            patch = patch.transform(
++                (target_w, target_h),
++                Image.AFFINE,
++                coeffs,
++                resample=Image.BICUBIC,
++                fillcolor=(0, 0, 0, 0),
++            )
++
++        position = _compute_patch_position(
++            placement_mode,
++            (img_h, img_w),
++            (target_h, target_w),
++            (self.patch_x, self.patch_y),
++            rng,
++        )
++        if self.patch_snap_to_token_grid:
++            position = _snap_patch_position_to_grid(
++                position,
++                (img_h, img_w),
++                (target_h, target_w),
++                self.patch_token_grid_size,
++            )
++        return _PatchEpisode(patch=patch, position=position, angle=angle, shx=shx, shy=shy, scale=scale)
++
++    def _paste_patch(self, img: np.ndarray, patch_episode: _PatchEpisode) -> np.ndarray:
++        base = Image.fromarray(img).convert("RGBA")
++        patch = patch_episode.patch
++        alpha = max(0.0, min(float(self.patch_alpha), 1.0))
++        if alpha < 1.0:
++            patch = patch.copy()
++            mask = patch.getchannel("A")
++            mask = mask.point(lambda p: int(p * alpha))
++            patch.putalpha(mask)
++        base.paste(patch, patch_episode.position, mask=patch.getchannel("A"))
++        return np.asarray(base.convert("RGB"))
++
++    def _sync_patch_episode_for_image(
++        self, src_episode: _PatchEpisode, img_shape: tuple[int, int]
++    ) -> _PatchEpisode:
++        img_h, img_w = img_shape
++        patch_w, patch_h = src_episode.patch.size
++        max_x = max(img_w - patch_w, 0)
++        max_y = max(img_h - patch_h, 0)
++        x = min(max(src_episode.position[0], 0), max_x)
++        y = min(max(src_episode.position[1], 0), max_y)
++        return _PatchEpisode(
++            patch=src_episode.patch,
++            position=(int(x), int(y)),
++            angle=src_episode.angle,
++            shx=src_episode.shx,
++            shy=src_episode.shy,
++            scale=src_episode.scale,
++        )
++
++    def _maybe_apply_patch(
++        self,
++        img: np.ndarray,
++        patch_episode: _PatchEpisode | None,
++        camera_label: str,
++    ) -> tuple[np.ndarray, _PatchEpisode]:
++        if self._patch_base_image is None or self._patch_rng is None:
++            return img, patch_episode
++        if patch_episode is None:
++            patch_episode = self._prepare_patch_for_episode(self._patch_base_image, img.shape[:2], self._patch_rng)
++            logging.info(
++                "Patch placement/geom (%s): pos=%s angle=%.2f shx=%.3f shy=%.3f scale=%.3f",
++                camera_label,
++                patch_episode.position,
++                patch_episode.angle,
++                patch_episode.shx,
++                patch_episode.shy,
++                patch_episode.scale,
++            )
++        return self._paste_patch(img, patch_episode), patch_episode
++
++    def _apply_patch_in_processed_orientation(
++        self,
++        img: np.ndarray,
++        patch_episode: _PatchEpisode | None,
++        camera_label: str,
++    ) -> tuple[np.ndarray, _PatchEpisode | None]:
++        processed_img = np.ascontiguousarray(img[::-1, ::-1])
++        processed_img, patch_episode = self._maybe_apply_patch(processed_img, patch_episode, camera_label)
++        return np.ascontiguousarray(processed_img[::-1, ::-1]), patch_episode
++
++    def _apply_patch_to_images(self, raw_images: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
++        if not self.use_patch or self._patch_base_image is None:
++            return raw_images
++
++        patched = dict(raw_images)
++        camera_mode = self.patch_cameras
++        if camera_mode == "agent" and _PATCH_AGENT_CAMERA in patched:
++            patched[_PATCH_AGENT_CAMERA], self._patch_episode_agent = self._apply_patch_in_processed_orientation(
++                patched[_PATCH_AGENT_CAMERA], self._patch_episode_agent, "agent"
++            )
++            return patched
++
++        if camera_mode == "wrist" and _PATCH_WRIST_CAMERA in patched:
++            patched[_PATCH_WRIST_CAMERA], self._patch_episode_wrist = self._apply_patch_in_processed_orientation(
++                patched[_PATCH_WRIST_CAMERA], self._patch_episode_wrist, "wrist"
++            )
++            return patched
++
++        if camera_mode == "both":
++            if _PATCH_AGENT_CAMERA in patched:
++                patched[_PATCH_AGENT_CAMERA], self._patch_episode_agent = self._apply_patch_in_processed_orientation(
++                    patched[_PATCH_AGENT_CAMERA], self._patch_episode_agent, "agent"
++                )
++            if _PATCH_WRIST_CAMERA in patched:
++                if self.patch_sync_wrist_with_agent and self._patch_episode_agent is not None:
++                    if self._patch_episode_wrist is None:
++                        self._patch_episode_wrist = self._sync_patch_episode_for_image(
++                            self._patch_episode_agent, patched[_PATCH_WRIST_CAMERA].shape[:2]
++                        )
++                        logging.info(
++                            "Patch placement/geom (wrist-sync): pos=%s angle=%.2f shx=%.3f shy=%.3f scale=%.3f",
++                            self._patch_episode_wrist.position,
++                            self._patch_episode_wrist.angle,
++                            self._patch_episode_wrist.shx,
++                            self._patch_episode_wrist.shy,
++                            self._patch_episode_wrist.scale,
++                        )
++                    wrist_processed = np.ascontiguousarray(patched[_PATCH_WRIST_CAMERA][::-1, ::-1])
++                    wrist_processed = self._paste_patch(
++                        wrist_processed, self._patch_episode_wrist
++                    )
++                    patched[_PATCH_WRIST_CAMERA] = np.ascontiguousarray(wrist_processed[::-1, ::-1])
++                else:
++                    patched[_PATCH_WRIST_CAMERA], self._patch_episode_wrist = self._apply_patch_in_processed_orientation(
++                        patched[_PATCH_WRIST_CAMERA], self._patch_episode_wrist, "wrist"
++                    )
++        return patched
+ 
+     def _make_envs_task(self, task_suite: Any, task_id: int = 0):
+         task = task_suite.get_task(task_id)
+@@ -238,14 +675,48 @@ class LiberoEnv(gym.Env):
+             "camera_heights": self.observation_height,
+             "camera_widths": self.observation_width,
+         }
++        if self.patch_in_sim:
++            if self.patch_texture_path is None:
++                raise ValueError("patch_in_sim=True requires patch_texture_path to be set.")
++            patch_texture_path = self._resolve_patch_image_path(self.patch_texture_path)
++            env_args.update(
++                {
++                    "patch_in_sim": True,
++                    "patch_texture_path": str(patch_texture_path),
++                    "patch_texture_mode": self.patch_texture_mode,
++                    "patch_texture_res": self.patch_texture_res,
++                    "patch_texture_rotate": self.patch_texture_rotate,
++                    "patch_size": self.patch_size_m,
++                    "patch_thickness": self.patch_thickness_m,
++                    "patch_margin": self.patch_margin_m,
++                    "patch_clearance": self.patch_clearance_m,
++                    "patch_max_tries": self.patch_max_tries,
++                    "patch_seed": self.patch_seed,
++                    "patch_placement": self.patch_placement,
++                }
++            )
++            logging.info(
++                "LIBERO sim patch config: texture=%s placement=%s size_m=%s margin=%.3f clearance=%.3f tries=%d seed=%s",
++                patch_texture_path,
++                self.patch_placement,
++                self.patch_size_m,
++                self.patch_margin_m,
++                self.patch_clearance_m,
++                self.patch_max_tries,
++                self.patch_seed,
++            )
+         env = OffScreenRenderEnv(**env_args)
+         env.reset()
+         return env
+ 
+     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
++        raw_images = {camera_name: raw_obs[camera_name] for camera_name in self.camera_name}
++        if self.use_patch:
++            raw_images = self._apply_patch_to_images(raw_images)
++
+         images = {}
+         for camera_name in self.camera_name:
+-            image = raw_obs[camera_name]
++            image = raw_images[camera_name]
+             images[self.camera_name_mapping[camera_name]] = image
+ 
+         eef_pos = raw_obs.get("robot0_eef_pos")
+@@ -296,17 +767,15 @@ class LiberoEnv(gym.Env):
+     def reset(self, seed=None, **kwargs):
+         super().reset(seed=seed)
+         self._env.seed(seed)
++        self._reset_patch_state(seed)
+         raw_obs = self._env.reset()
+         if self.init_states and self._init_states is not None:
+             raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
+             self.init_state_id += self._reset_stride  # Change init_state_id when reset
+ 
+-        # After reset, objects may be unstable (slightly floating, intersecting, etc.).
+-        # Step the simulator with a no-op action for a few frames so everything settles.
+-        # Increasing this value can improve determinism and reproducibility across resets.
+-        for _ in range(self.num_steps_wait):
+-            raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
+-
++        # Configure the controller mode before applying settling/no-op steps.
++        # Otherwise the "no-op" action can be interpreted with the wrong action convention
++        # (e.g. absolute instead of relative), which may move the arm into a bad pose at reset.
+         if self.control_mode == "absolute":
+             for robot in self._env.robots:
+                 robot.controller.use_delta = False
+@@ -315,6 +784,12 @@ class LiberoEnv(gym.Env):
+                 robot.controller.use_delta = True
+         else:
+             raise ValueError(f"Invalid control mode: {self.control_mode}")
++
++        # After reset, objects may be unstable (slightly floating, intersecting, etc.).
++        # Step the simulator with a no-op action for a few frames so everything settles.
++        # Increasing this value can improve determinism and reproducibility across resets.
++        for _ in range(self.num_steps_wait):
++            raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
+         observation = self._format_raw_obs(raw_obs)
+         info = {"is_success": False}
+         return observation, info

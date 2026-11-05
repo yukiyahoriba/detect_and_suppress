@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "criterion": "mean",
+  "correlation_threshold": 0.6,
+  "features": [
+    {
+      "expert": "vlm",
+      "layer": 9,
+      "feature_id": 123,
+      "num_episodes_fired": 8,
+      "num_episodes_valid_r": 8,
+      "num_episodes_r_gt_threshold": 8,
+      "threshold": 0.6,
+      "mean_pearson_r": 0.9896872290214509,
+      "median_pearson_r": 0.9995665301047101,
+      "std_pearson_r": 0.025588336299172867,
+      "min_pearson_r": 0.9220118865660621,
+      "max_pearson_r": 0.9999339398616587,
+      "total_fire_count": 28,
+      "episode_ids": [
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        33
+      ]
+    }
+  ],
+  "metadata": {
+    "sae_sha256": "48f3c8726e03d7939fbe76ad25be7eaefcb168d61821934aa68d415b343b6515",
+    "source": "saved episode-level Pearson summary; recorded feature selected explicitly",
+    "original_selection_sha256": "2c2bf5c93227aa9c40d1272bfb61995e9387c93d39245fcea1699371e20cbc48"
+  }
+}
